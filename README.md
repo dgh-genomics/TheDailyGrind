@@ -48,7 +48,8 @@ The MobileSAM model weights (~39MB) are downloaded automatically on first run.
 
 ## Inspired By
 
-[coffeegrindsize](https://github.com/jgagneastro/coffeegrindsize) by Jonathan Gagne — the original coffee grind analyzer that pioneered image-based particle size analysis for coffee.
+- [coffeegrindsize](https://github.com/jgagneastro/coffeegrindsize) by Jonathan Gagne — the original coffee grind analyzer that pioneered image-based particle size analysis for coffee
+- [coffeegrindsize v1.0.0](https://github.com/csatt/coffeegrindsize/releases/tag/v1.0.0) by csatt — a refined fork with improved usability
 
 ## License
 
