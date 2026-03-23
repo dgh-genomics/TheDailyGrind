@@ -1,4 +1,4 @@
-# Coffee Grind Size Analyzer
+# TheDailyGrind
 
 A modern, easy-to-use tool for analyzing coffee grind particle size distributions from photographs. Upload a photo of your grounds on white paper, get a full size distribution and brew recommendation in seconds.
 
@@ -17,8 +17,8 @@ Uses a hybrid **MobileSAM + adaptive threshold** pipeline for robust particle de
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/coffeegrindsize.git
-cd coffeegrindsize
+git clone https://github.com/dgh-genomics/TheDailyGrind.git
+cd TheDailyGrind
 pip install -r requirements.txt
 streamlit run app.py
 ```
