@@ -72,6 +72,10 @@ MAX_IMAGE_DIM = 4000
 # A pixel is coffee if its blue value is below this fraction of the paper's
 DEFAULT_THRESHOLD = 0.588
 
+# Touching grains are split where the neck between them is narrower than this
+# fraction of the smaller grain's half-width
+SPLIT_RATIO = 0.5
+
 # coffeegrindsize's extraction model: water reaches ~0.1 mm into each grain
 EXTRACTION_DEPTH_MM = 0.1
 
@@ -154,7 +158,7 @@ def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np
 
 
 def _segment_threshold(image_bgr, coin_mask=None, threshold=DEFAULT_THRESHOLD,
-                       min_area_px=5, split_touching=True, split_h=1.0):
+                       min_area_px=5, split_touching=True, split_ratio=SPLIT_RATIO):
     """
     Threshold the paper-normalized blue channel and split touching grains.
     Returns particles whose "segmentation" is cropped to "bbox" (x0, y0, x1, y1),
@@ -167,16 +171,21 @@ def _segment_threshold(image_bgr, coin_mask=None, threshold=DEFAULT_THRESHOLD,
 
     components, n_components = ndi.label(binary, structure=np.ones((3, 3)))
     if split_touching:
-        # One marker per distance-transform peak that rises at least split_h px
-        # above the neck joining it to a neighbouring grain
+        # One marker per distance-transform peak whose neck to a neighbouring peak
+        # is narrower than split_ratio × its own half-width. On log distance this
+        # is scale-free, so big irregular grains aren't chopped up at their bumps.
         dist = ndi.distance_transform_edt(binary)
-        markers, n_markers = ndi.label(h_maxima(dist, split_h), structure=np.ones((3, 3)))
+        log_dist = np.log(np.maximum(dist, 1.0))
+        markers, n_markers = ndi.label(h_maxima(log_dist, -np.log(split_ratio)), structure=np.ones((3, 3)))
         # Components without a peak (e.g. 1-px-wide specks) keep a single marker
         has_marker = np.zeros(n_components + 1, bool)
         has_marker[components[markers > 0]] = True
         missing = binary & ~has_marker[components]
         markers[missing] = components[missing] + n_markers
         labels = watershed(-dist, markers, mask=binary, connectivity=2)
+        # h_maxima keeps both of two equal-height peaks, cutting one grain in two;
+        # re-apply the neck rule to the regions themselves
+        labels = _merge_wide_necks(labels, dist, split_ratio)
     else:
         labels = components
 
@@ -205,6 +214,45 @@ def _segment_threshold(image_bgr, coin_mask=None, threshold=DEFAULT_THRESHOLD,
         })
 
     return particles, binary
+
+
+def _merge_wide_necks(labels: np.ndarray, dist: np.ndarray, split_ratio: float) -> np.ndarray:
+    """
+    Merge neighbouring regions whose shared boundary (neck) is wider than
+    split_ratio × the smaller region's peak half-width: they are one grain.
+    """
+    n = int(labels.max())
+    if n < 2:
+        return labels
+    peak = ndi.maximum(dist, labels, index=np.arange(n + 1))
+
+    # Every horizontally / vertically adjacent pixel pair that crosses a boundary
+    a = np.concatenate([labels[:, :-1].ravel(), labels[:-1, :].ravel()])
+    b = np.concatenate([labels[:, 1:].ravel(), labels[1:, :].ravel()])
+    d = np.concatenate([np.minimum(dist[:, :-1], dist[:, 1:]).ravel(),
+                        np.minimum(dist[:-1, :], dist[1:, :]).ravel()])
+    sel = (a != b) & (a > 0) & (b > 0)
+    if not sel.any():
+        return labels
+    lo, hi, d = np.minimum(a[sel], b[sel]), np.maximum(a[sel], b[sel]), d[sel]
+
+    # Neck half-width of each touching pair = largest distance value on its boundary
+    key = lo.astype(np.int64) * (n + 1) + hi
+    order = np.argsort(key, kind="stable")
+    pairs, start = np.unique(key[order], return_index=True)
+    neck = np.maximum.reduceat(d[order], start)
+    lo, hi = pairs // (n + 1), pairs % (n + 1)
+    merge = neck > split_ratio * np.minimum(peak[lo], peak[hi])
+
+    parent = np.arange(n + 1)
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for x, y in zip(lo[merge], hi[merge]):
+        parent[root(x)] = root(y)
+    return np.array([root(i) for i in range(n + 1)])[labels]
 
 
 def _crop_to_mask(mask):
@@ -349,28 +397,92 @@ def _make_threshold_image(masks: list, h: int, w: int) -> np.ndarray:
     return binary
 
 
+def _refine_coin_edge(gray: np.ndarray, cx: float, cy: float, r: float, n_rays: int = 360):
+    """
+    Measure a candidate coin's outer edge along n_rays rays. On each ray the edge
+    is where the profile rises through half-way between the coin rim and the
+    paper (the same half-way rule used for grains), taking the crossing nearest
+    the candidate radius so grains just outside the coin are ignored. An ellipse
+    is fitted, since a tilted phone sees the coin slightly oval.
+    Returns ((cx, cy), (axis1, axis2), angle, consistency) or None, where
+    consistency is the fraction of rays within 1% of the fitted edge.
+    """
+    radii = np.arange(0.75 * r, 1.4 * r, 0.5)
+    angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+    xs = cx + np.outer(np.cos(angles), radii)
+    ys = cy + np.outer(np.sin(angles), radii)
+    profiles = ndi.map_coordinates(gray, [ys, xs], order=1, mode="nearest")
+
+    paper = np.percentile(profiles[:, radii >= 1.2 * r], 75, axis=1)
+    rim = profiles[:, (radii >= 0.85 * r) & (radii <= 1.1 * r)].min(axis=1)
+    half = (paper + rim) / 2
+    points = []
+    for i in range(n_rays):
+        if paper[i] - rim[i] < 15:  # no visible edge on this ray
+            continue
+        below = profiles[i] < half[i]
+        rises = np.flatnonzero(below[:-1] & ~below[1:])  # dark → light going outward
+        if rises.size == 0:
+            continue
+        j = rises[np.argmin(np.abs(radii[rises] - r))]
+        # Interpolate where the profile crosses half-way between samples j and j+1
+        p0, p1 = profiles[i, j], profiles[i, j + 1]
+        rho = radii[j] + (half[i] - p0) / (p1 - p0) * (radii[j + 1] - radii[j])
+        points.append((cx + rho * np.cos(angles[i]), cy + rho * np.sin(angles[i])))
+
+    if len(points) < n_rays * 0.5:
+        return None
+    points = np.array(points, dtype=np.float32)
+
+    # Robust ellipse fit: drop points far from the current fit (grains on the rim, glare)
+    keep = np.ones(len(points), bool)
+    for _ in range(6):
+        if keep.sum() < 5:
+            return None
+        (ex, ey), (a1, a2), angle = cv2.fitEllipse(points[keep])
+        c, s = np.cos(np.deg2rad(angle)), np.sin(np.deg2rad(angle))
+        dx, dy = points[:, 0] - ex, points[:, 1] - ey
+        u, v = dx * c + dy * s, -dx * s + dy * c
+        resid = np.abs(np.sqrt((2 * u / a1) ** 2 + (2 * v / a2) ** 2) - 1) * np.sqrt(a1 * a2) / 2
+        keep = resid < max(1.5, 3 * 1.4826 * np.median(resid[keep]))
+    consistency = float(np.sum(resid < max(1.5, 0.01 * np.sqrt(a1 * a2) / 2)) / n_rays)
+    return (ex, ey), (a1, a2), angle, consistency
+
+
 def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     """Try to auto-detect a circular reference object. Returns (diameter_px, coin_mask)."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (9, 9), 2)
     h, w = gray.shape
 
-    min_r = int(w * 0.02)
-    max_r = int(w * 0.15)
+    # Find candidates on a ~1000 px copy (fast); the edge fit restores full precision
+    f = min(1.0, 1000 / max(h, w))
+    small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (9, 9), 2)
+    s = min(small.shape)
     circles = cv2.HoughCircles(
-        gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=int(w * 0.1),
-        param1=100, param2=40, minRadius=min_r, maxRadius=max_r,
+        small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=int(s * 0.1),
+        param1=100, param2=40, minRadius=int(s * 0.03), maxRadius=int(s * 0.4),
     )
     if circles is None:
         return 0.0, None
 
-    best = circles[0][0]
-    cx, cy, radius_px = int(best[0]), int(best[1]), best[2]
+    # The coin is the candidate whose edge is consistent all the way round;
+    # clusters of grains can form Hough circles but not a clean edge
+    gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    best = None
+    for x, y, r in circles[0][:10]:
+        fit = _refine_coin_edge(gray_f, x / f, y / f, r / f)
+        if fit is not None and fit[3] >= 0.6 and (best is None or fit[3] > best[3]):
+            best = fit
+    if best is None:
+        return 0.0, None
 
+    center, (a1, a2), angle, _ = best
     coin_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(coin_mask, (cx, cy), int(radius_px * 1.1), 255, -1)
+    cv2.ellipse(coin_mask, (center, (a1 * 1.1, a2 * 1.1), angle), 255, -1)
 
-    return float(2 * radius_px), coin_mask
+    # Equivalent-area diameter: the right average scale if the coin looks oval
+    return float(np.sqrt(a1 * a2)), coin_mask
 
 
 def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> tuple:

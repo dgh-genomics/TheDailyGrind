@@ -37,7 +37,7 @@ pip install -r requirements-sam.txt
 3. **Photograph** straight down with even, diffuse lighting
 4. **Avoid** shadows, piled-up grounds, and glossy surfaces
 
-Resolution limits accuracy most: fill the frame with the paper, and use your camera's full resolution (photos are analyzed at up to 4000 px). HEIC photos must be converted to JPEG for the comparison script.
+Use your camera's full resolution (photos are analyzed at up to 4000 px). With available-mass or surface weighting, the number of grains limits precision more than magnification does: a photo with a few hundred grains has a D50 uncertainty of ±5–7%, so shoot from far enough to fit a dense spread of a few thousand grains rather than a close-up. Count weighting depends on how many fines the camera resolves, so it shifts with camera distance. HEIC photos must be converted to JPEG for the comparison script.
 
 ## Comparing Grinder Settings
 
@@ -62,10 +62,10 @@ A suggested first experiment: one grinder, five adjacent settings plus two far-a
 
 1. **Paper normalization** — the blue channel (coffee's strongest contrast against white paper) is divided by a smooth estimate of the local paper brightness, so uneven lighting cancels out
 2. **Threshold** at 58.8% of the paper brightness — about half-way between coffee and paper, so blurred edges are neither grown nor shrunk
-3. **Watershed** on the distance transform splits touching grains
+3. **Watershed** on the distance transform splits touching grains, but only where the neck between them is narrower than half the smaller grain's width, so irregular single grains aren't chopped up at any magnification
 4. **Edge rejection** drops grains cut off by the image edge or the coin
 5. **Measurement** — equivalent-circle diameter; volume as an ellipsoid whose hidden axis equals its short axis; available mass assumes water reaches 0.1 mm into each grain
-6. **Hough circle detection** finds the reference coin for pixel-to-mm calibration
+6. **Coin calibration** — Hough circle candidates, then the coin's edge is measured along 360 rays and fitted with an ellipse, so a slightly tilted phone still gives the right average scale
 
 ## Requirements
 
