@@ -43,6 +43,11 @@ REFERENCE_OBJECTS = {
     "Custom…":          None,
 }
 
+# Fines / boulders are defined relative to the median diameter, so they mean the
+# same thing for every grind size and whether or not the image is calibrated.
+FINES_RATIO = 0.5     # fines:    smaller than half the median
+BOULDERS_RATIO = 2.0  # boulders: larger than twice the median
+
 # ── Lazy-loaded SAM predictor (singleton) ─────────────────────────────────
 _sam_predictor = None
 
@@ -135,16 +140,29 @@ def _find_candidate_points(image_bgr: np.ndarray, coin_mask: np.ndarray = None):
             "centroid": (int(cx), int(cy)),
             "bbox": (bx, by, bx + bw, by + bh),
             "area": area,
-            "component_mask": (labels == i),
+            # Cropped to bbox: a full-image mask per candidate costs GBs on fine grinds
+            "component_mask": labels[by:by + bh, bx:bx + bw] == i,
         })
 
     return candidates, binary
+
+
+def _crop_to_mask(mask):
+    """Crop a full-image boolean mask to its bounding box. Returns (crop, bbox)."""
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    # copy() so the full-size SAM output can be freed
+    return mask[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
 
 
 def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sam_candidates=500):
     """
     For each candidate, either use SAM to get a precise mask,
     or fall back to the threshold mask for tiny particles.
+
+    Each particle's "segmentation" is cropped to its "bbox" (x0, y0, x1, y1).
     """
     h, w = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -197,24 +215,30 @@ def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sa
                 # Validate: not too big, not background
                 if area > total_area * 0.02 or area < 2:
                     # Fall back to threshold mask
-                    mask = cand["component_mask"]
+                    mask, bbox = cand["component_mask"], cand["bbox"]
                     area = cand["area"]
+                    source = "threshold"
+                else:
+                    mask, bbox = _crop_to_mask(mask)
+                    source = "sam"
 
                 # Validate: must be darker than surroundings
-                if not _is_dark_particle(mask, gray, coin_mask):
+                if not _is_dark_particle(mask, bbox, gray, coin_mask):
                     continue
 
                 particle_masks.append({
                     "segmentation": mask,
+                    "bbox": bbox,
                     "area": area,
-                    "source": "sam",
+                    "source": source,
                 })
             except Exception:
                 # SAM failed — use threshold mask
                 mask = cand["component_mask"]
-                if _is_dark_particle(mask, gray, coin_mask):
+                if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
                     particle_masks.append({
                         "segmentation": mask,
+                        "bbox": cand["bbox"],
                         "area": cand["area"],
                         "source": "threshold",
                     })
@@ -222,9 +246,10 @@ def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sa
         # Add threshold-only candidates (too many for SAM)
         for cand in threshold_candidates:
             mask = cand["component_mask"]
-            if _is_dark_particle(mask, gray, coin_mask):
+            if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
                 particle_masks.append({
                     "segmentation": mask,
+                    "bbox": cand["bbox"],
                     "area": cand["area"],
                     "source": "threshold",
                 })
@@ -232,9 +257,10 @@ def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sa
         # No SAM — pure threshold
         for cand in candidates:
             mask = cand["component_mask"]
-            if _is_dark_particle(mask, gray, coin_mask):
+            if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
                 particle_masks.append({
                     "segmentation": mask,
+                    "bbox": cand["bbox"],
                     "area": cand["area"],
                     "source": "threshold",
                 })
@@ -242,31 +268,40 @@ def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sa
     return particle_masks
 
 
-def _is_dark_particle(mask, gray, coin_mask=None):
-    """Check that a mask region is darker than its surroundings."""
-    if np.sum(mask) < 2:
+def _is_dark_particle(mask, bbox, gray, coin_mask=None, pad=5):
+    """Check that a mask region (cropped to bbox) is darker than its surroundings."""
+    area = np.count_nonzero(mask)
+    if area < 2:
         return False
+
+    # Work in a padded window so the dilation below (reach 4 px) has room to grow
+    x0, y0, x1, y1 = bbox
+    h, w = gray.shape
+    wx0, wy0 = max(0, x0 - pad), max(0, y0 - pad)
+    wx1, wy1 = min(w, x1 + pad), min(h, y1 + pad)
+    local = np.zeros((wy1 - wy0, wx1 - wx0), dtype=bool)
+    local[y0 - wy0:y1 - wy0, x0 - wx0:x1 - wx0] = mask
+    gray_local = gray[wy0:wy1, wx0:wx1]
 
     # Skip if overlaps with coin
     if coin_mask is not None:
-        overlap = np.sum(mask & (coin_mask > 0))
-        if overlap > np.sum(mask) * 0.3:
+        overlap = np.count_nonzero(local & (coin_mask[wy0:wy1, wx0:wx1] > 0))
+        if overlap > area * 0.3:
             return False
 
-    mask_pixels = gray[mask]
-    mean_inside = np.mean(mask_pixels)
+    mean_inside = np.mean(gray_local[local])
 
     # Dilate to get surroundings
-    seg_uint8 = mask.astype(np.uint8) * 255
+    seg_uint8 = local.astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     dilated = cv2.dilate(seg_uint8, kernel, iterations=2)
-    surround = (dilated > 0) & (~mask)
+    surround = (dilated > 0) & (~local)
 
     if np.sum(surround) < 5:
         # Can't determine surroundings — accept if dark enough globally
         return mean_inside < 180
 
-    mean_outside = np.mean(gray[surround])
+    mean_outside = np.mean(gray_local[surround])
 
     # Particle must be noticeably darker than surroundings
     return mean_inside < mean_outside * 0.95
@@ -277,8 +312,11 @@ def _draw_outlines(image_bgr: np.ndarray, masks: list) -> np.ndarray:
     output = image_bgr.copy()
     rng = np.random.RandomState(42)
     for mask in masks:
-        seg = mask["segmentation"].astype(np.uint8) * 255
-        contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 1-px zero border so particles touching the crop edge get closed contours
+        seg = np.pad(mask["segmentation"], 1).astype(np.uint8) * 255
+        x0, y0 = mask["bbox"][:2]
+        contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                                       offset=(int(x0) - 1, int(y0) - 1))
         # Color by source: cyan for SAM, green for threshold-only
         if mask.get("source") == "sam":
             color = rng.randint(80, 255, size=3).tolist()
@@ -292,12 +330,13 @@ def _make_threshold_image(masks: list, h: int, w: int) -> np.ndarray:
     """Create a binary mask showing all detected particles."""
     binary = np.zeros((h, w), dtype=np.uint8)
     for mask in masks:
-        binary[mask["segmentation"]] = 255
+        x0, y0, x1, y1 = mask["bbox"]
+        binary[y0:y1, x0:x1][mask["segmentation"]] = 255
     return binary
 
 
-def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> tuple:
-    """Try to auto-detect a circular reference object."""
+def find_reference_circle(image_bgr: np.ndarray) -> tuple:
+    """Try to auto-detect a circular reference object. Returns (diameter_px, coin_mask)."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (9, 9), 2)
     h, w = gray.shape
@@ -313,13 +352,79 @@ def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> 
 
     best = circles[0][0]
     cx, cy, radius_px = int(best[0]), int(best[1]), best[2]
-    diameter_px = 2 * radius_px
-    pixel_scale = known_diameter_mm / diameter_px
 
     coin_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(coin_mask, (cx, cy), int(radius_px * 1.1), 255, -1)
 
-    return float(pixel_scale), coin_mask
+    return float(2 * radius_px), coin_mask
+
+
+def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> tuple:
+    """Try to auto-detect a circular reference object. Returns (mm_per_px, coin_mask)."""
+    diameter_px, coin_mask = find_reference_circle(image_bgr)
+    if diameter_px <= 0:
+        return 0.0, None
+    return float(known_diameter_mm / diameter_px), coin_mask
+
+
+def segment_particles(image_bgr: np.ndarray, coin_mask: np.ndarray = None) -> list:
+    """
+    The slow part of the pipeline (independent of calibration scale):
+      1. CLAHE + adaptive threshold to find ALL dark candidate regions
+      2. SAM predictor refines each candidate with point+box prompts
+      3. Threshold fallback for tiny particles / overflow
+    """
+    candidates, _ = _find_candidate_points(image_bgr, coin_mask)
+    return _refine_with_sam(image_bgr, candidates, coin_mask,
+                            use_sam=True, max_sam_candidates=500)
+
+
+def measure_particles(
+    image_bgr: np.ndarray,
+    particle_masks: list,
+    pixel_scale: float = 0.0,
+) -> AnalysisResult:
+    """Measure segmented particles and compute statistics (fast)."""
+    h, w = image_bgr.shape[:2]
+
+    areas_px = np.array([m["area"] for m in particle_masks], dtype=np.float64)
+    diameters_px = 2.0 * np.sqrt(areas_px / np.pi)
+
+    if pixel_scale > 0:
+        diameters_mm = diameters_px * pixel_scale
+    else:
+        diameters_mm = diameters_px
+
+    # Visuals
+    labeled = _draw_outlines(image_bgr, particle_masks)
+    threshold = _make_threshold_image(particle_masks, h, w)
+
+    # Stats — all zero when nothing was detected
+    if len(diameters_mm) > 0:
+        median = float(np.median(diameters_mm))
+        d10, d50, d90 = (float(v) for v in np.percentile(diameters_mm, [10, 50, 90]))
+        fines_pct = float(np.mean(diameters_mm < FINES_RATIO * median) * 100)
+        boulders_pct = float(np.mean(diameters_mm > BOULDERS_RATIO * median) * 100)
+        mean, std = float(np.mean(diameters_mm)), float(np.std(diameters_mm))
+    else:
+        median = mean = std = d10 = d50 = d90 = fines_pct = boulders_pct = 0.0
+
+    return AnalysisResult(
+        diameters_mm=diameters_mm,
+        areas_px=areas_px,
+        num_particles=int(len(particle_masks)),
+        pixel_scale=pixel_scale,
+        labeled_image=labeled,
+        threshold_image=threshold,
+        median_diameter_mm=median,
+        mean_diameter_mm=mean,
+        std_diameter_mm=std,
+        d10_mm=d10,
+        d50_mm=d50,
+        d90_mm=d90,
+        fines_pct=fines_pct,
+        boulders_pct=boulders_pct,
+    )
 
 
 def analyze_image(
@@ -328,56 +433,6 @@ def analyze_image(
     min_area_px: int = 3,
     coin_mask: np.ndarray = None,
 ) -> AnalysisResult:
-    """
-    Hybrid analysis pipeline:
-      1. CLAHE + adaptive threshold to find ALL dark candidate regions
-      2. SAM predictor refines each candidate with point+box prompts
-      3. Threshold fallback for tiny particles / overflow
-      4. Measure and compute statistics
-    """
-    h, w = image_bgr.shape[:2]
-
-    # 1. Find candidates via threshold
-    candidates, binary_preview = _find_candidate_points(image_bgr, coin_mask)
-
-    # 2. Refine with SAM (point-prompted) + threshold fallback
-    particle_masks = _refine_with_sam(image_bgr, candidates, coin_mask,
-                                       use_sam=True, max_sam_candidates=500)
-
-    # 3. Measure
-    areas_px = np.array([m["area"] for m in particle_masks], dtype=np.float64)
-    if len(areas_px) == 0:
-        areas_px = np.array([0.0])
-
-    diameters_px = 2.0 * np.sqrt(areas_px / np.pi)
-
-    if pixel_scale > 0:
-        diameters_mm = diameters_px * pixel_scale
-    else:
-        diameters_mm = diameters_px
-
-    # 4. Visuals
-    labeled = _draw_outlines(image_bgr, particle_masks)
-    threshold = _make_threshold_image(particle_masks, h, w)
-
-    # 5. Stats
-    if len(diameters_mm) == 0 or (len(diameters_mm) == 1 and diameters_mm[0] == 0):
-        diameters_mm = np.array([0.0])
-
-    result = AnalysisResult(
-        diameters_mm=diameters_mm,
-        areas_px=areas_px,
-        num_particles=int(len(particle_masks)),
-        pixel_scale=pixel_scale,
-        labeled_image=labeled,
-        threshold_image=threshold,
-        median_diameter_mm=float(np.median(diameters_mm)),
-        mean_diameter_mm=float(np.mean(diameters_mm)),
-        std_diameter_mm=float(np.std(diameters_mm)),
-        d10_mm=float(np.percentile(diameters_mm, 10)),
-        d50_mm=float(np.percentile(diameters_mm, 50)),
-        d90_mm=float(np.percentile(diameters_mm, 90)),
-        fines_pct=float(np.mean(diameters_mm < np.percentile(diameters_mm, 10)) * 100),
-        boulders_pct=float(np.mean(diameters_mm > np.percentile(diameters_mm, 90)) * 100),
-    )
-    return result
+    """Full pipeline: segment_particles() then measure_particles()."""
+    particle_masks = segment_particles(image_bgr, coin_mask)
+    return measure_particles(image_bgr, particle_masks, pixel_scale)

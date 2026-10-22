@@ -11,9 +11,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from grind_analyzer import (
-    analyze_image,
-    detect_reference_circle,
+    segment_particles,
+    measure_particles,
+    find_reference_circle,
     REFERENCE_OBJECTS,
+    FINES_RATIO,
+    BOULDERS_RATIO,
     AnalysisResult,
 )
 
@@ -148,6 +151,29 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
     return fig
 
 
+@st.cache_data(max_entries=4, show_spinner="Running MobileSAM segmentation (first run loads model)…")
+def segment_upload(file_bytes: bytes, use_calibration: bool):
+    """Decode an upload, find the coin and segment particles.
+
+    Cached on the file bytes, so reruns (any click, changing the reference coin)
+    skip MobileSAM. Returns None if the image can't be decoded.
+    """
+    image_bgr = cv2.imdecode(np.frombuffer(file_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        return None
+
+    # Downscale very large images for speed
+    h, w = image_bgr.shape[:2]
+    max_dim = 2000
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    coin_diameter_px, coin_mask = find_reference_circle(image_bgr) if use_calibration else (0.0, None)
+    particle_masks = segment_particles(image_bgr, coin_mask)
+    return image_bgr, coin_diameter_px, particle_masks
+
+
 # ── Main UI ──────────────────────────────────────────────────────────────────
 st.title("☕ Coffee Grind Size Analyzer")
 st.caption("Drop a photo of your grounds on a white background. Get your particle size distribution in seconds.")
@@ -180,27 +206,15 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    # Load image
-    file_bytes = np.frombuffer(uploaded.read(), dtype=np.uint8)
-    image_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    if image_bgr is None:
+    segmented = segment_upload(uploaded.getvalue(), use_calibration)
+    if segmented is None:
         st.error("Could not read image. Please try a different file.")
         st.stop()
-
-    # Downscale very large images for speed
-    h, w = image_bgr.shape[:2]
-    max_dim = 2000
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    image_bgr, coin_diameter_px, particle_masks = segmented
 
     # Calibrate
-    pixel_scale = 0.0
-    coin_mask = None
-    if use_calibration and ref_diameter_mm:
-        with st.spinner("Detecting reference object…"):
-            pixel_scale, coin_mask = detect_reference_circle(image_bgr, ref_diameter_mm)
+    pixel_scale = ref_diameter_mm / coin_diameter_px if coin_diameter_px > 0 else 0.0
+    if use_calibration:
         if pixel_scale > 0:
             st.success(f"Calibrated: **{pixel_scale:.4f} mm/px** using {ref_choice}")
         else:
@@ -208,24 +222,29 @@ if uploaded is not None:
 
     unit = "mm" if pixel_scale > 0 else "px"
 
-    # Analyze
-    with st.spinner("Running MobileSAM segmentation (first run loads model)…"):
-        result = analyze_image(image_bgr, pixel_scale=pixel_scale, coin_mask=coin_mask)
+    result = measure_particles(image_bgr, particle_masks, pixel_scale)
 
     # ── Results ──────────────────────────────────────────────────────────
     st.markdown("---")
 
     # Metrics row
-    cols = st.columns(6)
+    cols = st.columns(8)
     cols[0].metric("Particles", f"{result.num_particles:,}")
     cols[1].metric(f"Median ({unit})", f"{result.median_diameter_mm:.2f}")
     cols[2].metric(f"Mean ({unit})", f"{result.mean_diameter_mm:.2f}")
     cols[3].metric("D10", f"{result.d10_mm:.2f}")
     cols[4].metric("D50", f"{result.d50_mm:.2f}")
     cols[5].metric("D90", f"{result.d90_mm:.2f}")
+    cols[6].metric("Fines", f"{result.fines_pct:.0f}%",
+                   help=f"Share of particles smaller than {FINES_RATIO:g}× the median diameter")
+    cols[7].metric("Boulders", f"{result.boulders_pct:.0f}%",
+                   help=f"Share of particles larger than {BOULDERS_RATIO:g}× the median diameter")
 
     # Brew recommendation
-    if pixel_scale > 0:
+    if result.num_particles == 0:
+        st.warning("No particles detected. Spread the grounds in a thin layer on white paper "
+                   "with even lighting, and try again.")
+    elif pixel_scale > 0:
         brew = classify_grind(result.median_diameter_mm)
         uniformity = result.std_diameter_mm / result.mean_diameter_mm if result.mean_diameter_mm > 0 else 0
         uni_label = "Excellent" if uniformity < 0.3 else "Good" if uniformity < 0.5 else "Fair" if uniformity < 0.7 else "Poor"
