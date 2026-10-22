@@ -1,32 +1,50 @@
 """
 Coffee Grind Size Analyzer — Core Image Processing
-Hybrid approach: CLAHE threshold finds candidate particles, SAM refines each one.
+
+Every particle is measured the same way, so results don't depend on how
+densely the grounds are spread:
+  1. Blue channel divided by a smooth estimate of the paper brightness
+  2. Threshold at 58.8% of the paper (as coffeegrindsize does) — about half-way
+     between coffee and paper, so blurred edges are neither grown nor shrunk
+  3. Distance-transform watershed splits touching grains
+  4. Grains cut off by the image edge or the coin are dropped
+  5. Optional: MobileSAM refines larger grains (pip install -r requirements-sam.txt)
 """
 
 import cv2
 import numpy as np
-import torch
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from scipy import ndimage as ndi
+from skimage.morphology import h_maxima
+from skimage.segmentation import watershed
 
 warnings.filterwarnings("ignore")
 
 @dataclass
 class AnalysisResult:
-    """Results from a grind size analysis."""
-    diameters_mm: np.ndarray
+    """Results from a grind size analysis.
+
+    Sizes are in mm when calibrated (pixel_scale > 0), otherwise in px.
+    Percentiles, mean, std and fines/boulders are weighted by `weighting`.
+    """
+    diameters_mm: np.ndarray   # equivalent-circle diameter of each particle
     areas_px: np.ndarray
+    volumes_mm3: np.ndarray    # ellipsoid volume of each particle (px³ if uncalibrated)
+    weights: np.ndarray        # each particle's weight under `weighting`
+    weighting: str
     num_particles: int
     pixel_scale: float
     labeled_image: np.ndarray
     threshold_image: np.ndarray
-    median_diameter_mm: float
+    median_diameter_mm: float  # weighted median, same as d50_mm
     mean_diameter_mm: float
     std_diameter_mm: float
     d10_mm: float
     d50_mm: float
     d90_mm: float
+    d50_se_mm: float           # bootstrap standard error of D50 (particle counting noise)
     fines_pct: float
     boulders_pct: float
 
@@ -43,10 +61,26 @@ REFERENCE_OBJECTS = {
     "Custom…":          None,
 }
 
-# Fines / boulders are defined relative to the median diameter, so they mean the
-# same thing for every grind size and whether or not the image is calibrated.
-FINES_RATIO = 0.5     # fines:    smaller than half the median
-BOULDERS_RATIO = 2.0  # boulders: larger than twice the median
+# Fines / boulders are defined relative to D50, so they mean the same thing for
+# every grind size and whether or not the image is calibrated.
+FINES_RATIO = 0.5     # fines:    smaller than half of D50
+BOULDERS_RATIO = 2.0  # boulders: larger than twice D50
+
+# Larger photos are downscaled. Resolution limits accuracy, so keep this high.
+MAX_IMAGE_DIM = 4000
+
+# A pixel is coffee if its blue value is below this fraction of the paper's
+DEFAULT_THRESHOLD = 0.588
+
+# coffeegrindsize's extraction model: water reaches ~0.1 mm into each grain
+EXTRACTION_DEPTH_MM = 0.1
+
+WEIGHTINGS = {
+    "available mass": "Mass that water can reach (outer 0.1 mm of each grain), coffeegrindsize's default",
+    "mass":           "Grain volume, comparable to sieve or laser-diffraction results",
+    "surface":        "Projected grain area",
+    "count":          "Every grain counts equally, so fines dominate",
+}
 
 # ── Lazy-loaded SAM predictor (singleton) ─────────────────────────────────
 _sam_predictor = None
@@ -68,6 +102,7 @@ def _get_sam_predictor():
     if _sam_predictor is not None:
         return _sam_predictor
 
+    import torch
     from mobile_sam import sam_model_registry, SamPredictor
 
     model_path = Path(__file__).parent / "mobile_sam.pt"
@@ -84,67 +119,92 @@ def _get_sam_predictor():
     return _sam_predictor
 
 
-def _find_candidate_points(image_bgr: np.ndarray, coin_mask: np.ndarray = None):
+def prepare_image(image_bgr: np.ndarray, max_dim: int = MAX_IMAGE_DIM) -> np.ndarray:
+    """Downscale very large images so their longest side is at most max_dim."""
+    h, w = image_bgr.shape[:2]
+    if max(h, w) <= max_dim:
+        return image_bgr
+    scale = max_dim / max(h, w)
+    return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np.ndarray:
+    """Blue channel divided by a smooth estimate of the local paper brightness (paper ≈ 1)."""
+    blue = image_bgr[:, :, 0]
+    h, w = blue.shape
+
+    # The paper estimate is smooth, so compute it at quarter resolution
+    small = cv2.resize(blue, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA).astype(np.float32)
+    keep = np.ones(small.shape, bool)
+    if exclude is not None:
+        keep = cv2.resize(exclude, small.shape[::-1], interpolation=cv2.INTER_NEAREST) == 0
+    otsu, _ = cv2.threshold(small.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    paper_mask = (small > otsu) & keep
+
+    # Normalized convolution: average only nearby paper pixels, so grains and
+    # the coin don't drag the estimate down, whatever their size
+    sigma = max(small.shape) / 50
+    for _ in range(2):
+        weight = cv2.GaussianBlur(paper_mask.astype(np.float32), (0, 0), sigma)
+        paper = cv2.GaussianBlur(small * paper_mask, (0, 0), sigma) / np.maximum(weight, 1e-3)
+        paper_mask = (small > 0.8 * paper) & keep
+
+    paper = cv2.resize(paper, (w, h), interpolation=cv2.INTER_LINEAR)
+    return blue.astype(np.float32) / np.maximum(paper, 1.0)
+
+
+def _segment_threshold(image_bgr, coin_mask=None, threshold=DEFAULT_THRESHOLD,
+                       min_area_px=5, split_touching=True, split_h=1.0):
     """
-    Use CLAHE + adaptive threshold to find ALL dark regions (candidate particles).
-    Returns centroids and bounding boxes for each candidate.
+    Threshold the paper-normalized blue channel and split touching grains.
+    Returns particles whose "segmentation" is cropped to "bbox" (x0, y0, x1, y1),
+    plus the full binary mask.
     """
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    # CLAHE to boost local contrast
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
-    enhanced = clahe.apply(gray)
-
-    # Two-pass adaptive threshold to catch both large and small particles
-    block1 = max(51, (min(h, w) // 12) | 1)  # larger block for bigger particles
-    block2 = max(15, (min(h, w) // 40) | 1)  # smaller block for fines
-
-    thresh1 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, block1, 4)
-    thresh2 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, block2, 3)
-
-    # Union of both passes
-    binary = cv2.bitwise_or(thresh1, thresh2)
-
-    # Remove coin region
+    h, w = image_bgr.shape[:2]
+    binary = _normalize_to_paper(image_bgr, coin_mask) < threshold
     if coin_mask is not None:
-        binary[coin_mask > 0] = 0
+        binary &= coin_mask == 0
 
-    # Light morphological cleanup — just remove single-pixel noise
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    components, n_components = ndi.label(binary, structure=np.ones((3, 3)))
+    if split_touching:
+        # One marker per distance-transform peak that rises at least split_h px
+        # above the neck joining it to a neighbouring grain
+        dist = ndi.distance_transform_edt(binary)
+        markers, n_markers = ndi.label(h_maxima(dist, split_h), structure=np.ones((3, 3)))
+        # Components without a peak (e.g. 1-px-wide specks) keep a single marker
+        has_marker = np.zeros(n_components + 1, bool)
+        has_marker[components[markers > 0]] = True
+        missing = binary & ~has_marker[components]
+        markers[missing] = components[missing] + n_markers
+        labels = watershed(-dist, markers, mask=binary, connectivity=2)
+    else:
+        labels = components
 
-    # Connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    # Grains cut off by the image edge or the coin would read too small
+    cut = np.zeros((h, w), bool)
+    cut[[0, -1], :] = True
+    cut[:, [0, -1]] = True
+    if coin_mask is not None:
+        cut |= cv2.dilate(coin_mask, np.ones((3, 3), np.uint8)) > 0
+    rejected = set(np.unique(labels[cut & (labels > 0)]).tolist())
 
-    candidates = []
-    total_area = h * w
-    for i in range(1, num_labels):  # skip background (0)
-        area = stats[i, cv2.CC_STAT_AREA]
-
-        # Filter: too small = noise, too large = shadow/background
-        if area < 3:
+    particles = []
+    max_area = h * w * 0.02  # larger = shadow or background, not a grain
+    for i, sl in enumerate(ndi.find_objects(labels), start=1):
+        if sl is None or i in rejected:
             continue
-        if area > total_area * 0.02:
+        mask = labels[sl] == i
+        area = int(np.count_nonzero(mask))
+        if area < min_area_px or area > max_area:
             continue
-
-        cx, cy = centroids[i]
-        bx = stats[i, cv2.CC_STAT_LEFT]
-        by = stats[i, cv2.CC_STAT_TOP]
-        bw = stats[i, cv2.CC_STAT_WIDTH]
-        bh = stats[i, cv2.CC_STAT_HEIGHT]
-
-        candidates.append({
-            "centroid": (int(cx), int(cy)),
-            "bbox": (bx, by, bx + bw, by + bh),
+        particles.append({
+            "segmentation": mask,
+            "bbox": (sl[1].start, sl[0].start, sl[1].stop, sl[0].stop),
             "area": area,
-            # Cropped to bbox: a full-image mask per candidate costs GBs on fine grinds
-            "component_mask": labels[by:by + bh, bx:bx + bw] == i,
+            "source": "threshold",
         })
 
-    return candidates, binary
+    return particles, binary
 
 
 def _crop_to_mask(mask):
@@ -157,115 +217,63 @@ def _crop_to_mask(mask):
     return mask[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
 
 
-def _refine_with_sam(image_bgr, candidates, coin_mask=None, use_sam=True, max_sam_candidates=500):
+def _refine_with_sam(image_bgr, particles, coin_mask=None, min_area_px=50):
     """
-    For each candidate, either use SAM to get a precise mask,
-    or fall back to the threshold mask for tiny particles.
-
-    Each particle's "segmentation" is cropped to its "bbox" (x0, y0, x1, y1).
+    Replace the threshold mask of every particle of at least min_area_px with a
+    MobileSAM mask (point + box prompt). Which particles get refined depends
+    only on their own size, never on how many others are in the photo.
     """
     h, w = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     total_area = h * w
 
-    particle_masks = []
+    predictor = _get_sam_predictor()
+    predictor.set_image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
 
-    if use_sam and len(candidates) > 0:
-        predictor = _get_sam_predictor()
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        predictor.set_image(image_rgb)
+    refined = []
+    for p in particles:
+        if p["area"] < min_area_px:
+            refined.append(p)
+            continue
 
-        # Sort by area descending — SAM works better on larger particles
-        # Use SAM for the largest candidates, threshold for the rest
-        candidates_sorted = sorted(candidates, key=lambda c: c["area"], reverse=True)
+        bx0, by0, bx1, by1 = p["bbox"]
+        ys, xs = np.nonzero(p["segmentation"])
+        point = np.array([[bx0 + xs.mean(), by0 + ys.mean()]], dtype=np.float32)
+        label = np.array([1], dtype=np.int32)  # 1 = foreground
 
-        # Batch point prompts for SAM
-        sam_candidates = candidates_sorted[:max_sam_candidates]
-        threshold_candidates = candidates_sorted[max_sam_candidates:]
+        # Add padding to bbox
+        pad = max(5, int(max(bx1 - bx0, by1 - by0) * 0.15))
+        box = np.array([
+            max(0, bx0 - pad), max(0, by0 - pad),
+            min(w, bx1 + pad), min(h, by1 + pad)
+        ], dtype=np.float32)
 
-        # Process SAM candidates in batches
-        for cand in sam_candidates:
-            cx, cy = cand["centroid"]
-            bx0, by0, bx1, by1 = cand["bbox"]
+        try:
+            masks, scores, _ = predictor.predict(
+                point_coords=point,
+                point_labels=label,
+                box=box[None, :],  # SAM expects [1, 4]
+                multimask_output=True,
+            )
+        except Exception:
+            refined.append(p)  # SAM failed — keep threshold mask
+            continue
 
-            # Use both point + box prompt for best results
-            point = np.array([[cx, cy]], dtype=np.float32)
-            label = np.array([1], dtype=np.int32)  # 1 = foreground
+        mask = masks[np.argmax(scores)]
+        area = int(np.sum(mask))
 
-            # Add padding to bbox
-            pad = max(5, int(max(bx1 - bx0, by1 - by0) * 0.15))
-            box = np.array([
-                max(0, bx0 - pad), max(0, by0 - pad),
-                min(w, bx1 + pad), min(h, by1 + pad)
-            ], dtype=np.float32)
+        # Validate: not too big, not background, darker than surroundings
+        if area > total_area * 0.02 or area < 2:
+            refined.append(p)
+            continue
+        crop, bbox = _crop_to_mask(mask)
+        if not _is_dark_particle(crop, bbox, gray, coin_mask):
+            refined.append(p)
+            continue
 
-            try:
-                masks, scores, _ = predictor.predict(
-                    point_coords=point,
-                    point_labels=label,
-                    box=box[None, :],  # SAM expects [1, 4]
-                    multimask_output=True,
-                )
+        refined.append({"segmentation": crop, "bbox": bbox, "area": area, "source": "sam"})
 
-                # Pick best mask
-                best_idx = np.argmax(scores)
-                mask = masks[best_idx]
-                area = int(np.sum(mask))
-
-                # Validate: not too big, not background
-                if area > total_area * 0.02 or area < 2:
-                    # Fall back to threshold mask
-                    mask, bbox = cand["component_mask"], cand["bbox"]
-                    area = cand["area"]
-                    source = "threshold"
-                else:
-                    mask, bbox = _crop_to_mask(mask)
-                    source = "sam"
-
-                # Validate: must be darker than surroundings
-                if not _is_dark_particle(mask, bbox, gray, coin_mask):
-                    continue
-
-                particle_masks.append({
-                    "segmentation": mask,
-                    "bbox": bbox,
-                    "area": area,
-                    "source": source,
-                })
-            except Exception:
-                # SAM failed — use threshold mask
-                mask = cand["component_mask"]
-                if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
-                    particle_masks.append({
-                        "segmentation": mask,
-                        "bbox": cand["bbox"],
-                        "area": cand["area"],
-                        "source": "threshold",
-                    })
-
-        # Add threshold-only candidates (too many for SAM)
-        for cand in threshold_candidates:
-            mask = cand["component_mask"]
-            if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
-                particle_masks.append({
-                    "segmentation": mask,
-                    "bbox": cand["bbox"],
-                    "area": cand["area"],
-                    "source": "threshold",
-                })
-    else:
-        # No SAM — pure threshold
-        for cand in candidates:
-            mask = cand["component_mask"]
-            if _is_dark_particle(mask, cand["bbox"], gray, coin_mask):
-                particle_masks.append({
-                    "segmentation": mask,
-                    "bbox": cand["bbox"],
-                    "area": cand["area"],
-                    "source": "threshold",
-                })
-
-    return particle_masks
+    return refined
 
 
 def _is_dark_particle(mask, bbox, gray, coin_mask=None, pad=5):
@@ -307,8 +315,18 @@ def _is_dark_particle(mask, bbox, gray, coin_mask=None, pad=5):
     return mean_inside < mean_outside * 0.95
 
 
+def _axis_ratio(mask) -> float:
+    """Minor/major axis ratio of the ellipse with the same second moments."""
+    ys, xs = np.nonzero(mask)
+    if xs.size < 3:
+        return 1.0
+    # + 1/12: the variance of a single pixel, so 1-px-wide grains aren't flat
+    ev = np.linalg.eigvalsh(np.cov(np.vstack([xs, ys]))) + 1 / 12
+    return float(np.clip(np.sqrt(ev[0] / ev[1]), 0.1, 1.0))
+
+
 def _draw_outlines(image_bgr: np.ndarray, masks: list) -> np.ndarray:
-    """Draw colored outlines on the original image for each detected particle."""
+    """Draw randomly coloured outlines (so split grains stand out) on the image."""
     output = image_bgr.copy()
     rng = np.random.RandomState(42)
     for mask in masks:
@@ -317,11 +335,7 @@ def _draw_outlines(image_bgr: np.ndarray, masks: list) -> np.ndarray:
         x0, y0 = mask["bbox"][:2]
         contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
                                        offset=(int(x0) - 1, int(y0) - 1))
-        # Color by source: cyan for SAM, green for threshold-only
-        if mask.get("source") == "sam":
-            color = rng.randint(80, 255, size=3).tolist()
-        else:
-            color = [0, 255, 128]  # green for threshold-detected
+        color = rng.randint(80, 255, size=3).tolist()
         cv2.drawContours(output, contours, -1, color, 1)
     return output
 
@@ -367,72 +381,136 @@ def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> 
     return float(known_diameter_mm / diameter_px), coin_mask
 
 
-def segment_particles(image_bgr: np.ndarray, coin_mask: np.ndarray = None) -> list:
+def segment_particles(
+    image_bgr: np.ndarray,
+    coin_mask: np.ndarray = None,
+    threshold: float = DEFAULT_THRESHOLD,
+    min_area_px: int = 5,
+    use_sam: bool = False,
+) -> list:
+    """The slow part of the pipeline (independent of calibration scale and weighting)."""
+    particles, _ = _segment_threshold(image_bgr, coin_mask, threshold, min_area_px)
+    if use_sam:
+        particles = _refine_with_sam(image_bgr, particles, coin_mask)
+    return particles
+
+
+def particle_sizes(particle_masks: list, pixel_scale: float = 0.0) -> tuple:
     """
-    The slow part of the pipeline (independent of calibration scale):
-      1. CLAHE + adaptive threshold to find ALL dark candidate regions
-      2. SAM predictor refines each candidate with point+box prompts
-      3. Threshold fallback for tiny particles / overflow
+    Per-particle (diameters, areas_px, volumes). Diameter is the equivalent-circle
+    diameter; volume treats each grain as an ellipsoid whose hidden (vertical)
+    axis equals its short axis, as coffeegrindsize does. Units are mm / mm³ when
+    pixel_scale > 0, otherwise px / px³.
     """
-    candidates, _ = _find_candidate_points(image_bgr, coin_mask)
-    return _refine_with_sam(image_bgr, candidates, coin_mask,
-                            use_sam=True, max_sam_candidates=500)
+    areas_px = np.array([m["area"] for m in particle_masks], dtype=np.float64)
+    ratios = np.array([_axis_ratio(m["segmentation"]) for m in particle_masks], dtype=np.float64)
+
+    scale = pixel_scale if pixel_scale > 0 else 1.0
+    diameters = 2.0 * np.sqrt(areas_px / np.pi) * scale
+    semi_major = np.sqrt(areas_px / (np.pi * np.maximum(ratios, 1e-6))) * scale
+    semi_minor = semi_major * ratios
+    volumes = 4.0 / 3.0 * np.pi * semi_major * semi_minor ** 2
+    return diameters, areas_px, volumes
+
+
+def particle_weights(areas_px, volumes, weighting: str, pixel_scale: float = 0.0) -> tuple:
+    """Per-particle weights for a weighting in WEIGHTINGS. Returns (weights, weighting_used).
+
+    "available mass" needs real units, so it falls back to "mass" when uncalibrated.
+    """
+    if weighting == "available mass" and pixel_scale <= 0:
+        weighting = "mass"
+    if weighting == "count":
+        return np.ones_like(areas_px), weighting
+    if weighting == "surface":
+        return np.asarray(areas_px, dtype=np.float64), weighting
+    if weighting == "mass":
+        return np.asarray(volumes, dtype=np.float64), weighting
+    if weighting == "available mass":
+        # Equivalent-sphere radius; only the outer EXTRACTION_DEPTH_MM shell is reachable
+        radii = (3.0 * volumes / (4.0 * np.pi)) ** (1 / 3)
+        core = 4.0 / 3.0 * np.pi * np.maximum(radii - EXTRACTION_DEPTH_MM, 0) ** 3
+        return volumes - core, weighting
+    raise ValueError(f"Unknown weighting {weighting!r}; expected one of {list(WEIGHTINGS)}")
+
+
+def weighted_percentile(values, weights, q):
+    """Percentile(s) q (0–100) of values under weights (midpoint-rule CDF)."""
+    order = np.argsort(values)
+    v, w = np.asarray(values)[order], np.asarray(weights)[order]
+    cdf = (np.cumsum(w) - 0.5 * w) / np.sum(w)
+    return np.interp(np.asarray(q) / 100.0, cdf, v)
+
+
+def size_stats(diameters, weights, n_boot: int = 200, seed: int = 0) -> dict:
+    """Weighted D10/D50/D90, mean, std, fines/boulders % of weight, and D50 standard error."""
+    if len(diameters) == 0:
+        return dict(d10=0.0, d50=0.0, d90=0.0, mean=0.0, std=0.0, d50_se=0.0,
+                    fines_pct=0.0, boulders_pct=0.0)
+    diameters, weights = np.asarray(diameters), np.asarray(weights)
+    d10, d50, d90 = (float(v) for v in weighted_percentile(diameters, weights, [10, 50, 90]))
+    mean = float(np.average(diameters, weights=weights))
+    std = float(np.sqrt(np.average((diameters - mean) ** 2, weights=weights)))
+    total = np.sum(weights)
+
+    # Counting noise: how much D50 moves when the same photo's grains are resampled
+    rng = np.random.default_rng(seed)
+    boots = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(diameters), len(diameters))
+        boots.append(weighted_percentile(diameters[idx], weights[idx], 50))
+
+    return dict(
+        d10=d10, d50=d50, d90=d90, mean=mean, std=std,
+        d50_se=float(np.std(boots)),
+        fines_pct=float(np.sum(weights[diameters < FINES_RATIO * d50]) / total * 100),
+        boulders_pct=float(np.sum(weights[diameters > BOULDERS_RATIO * d50]) / total * 100),
+    )
 
 
 def measure_particles(
     image_bgr: np.ndarray,
     particle_masks: list,
     pixel_scale: float = 0.0,
+    weighting: str = "available mass",
 ) -> AnalysisResult:
-    """Measure segmented particles and compute statistics (fast)."""
+    """Measure segmented particles and compute weighted statistics (fast)."""
     h, w = image_bgr.shape[:2]
 
-    areas_px = np.array([m["area"] for m in particle_masks], dtype=np.float64)
-    diameters_px = 2.0 * np.sqrt(areas_px / np.pi)
-
-    if pixel_scale > 0:
-        diameters_mm = diameters_px * pixel_scale
-    else:
-        diameters_mm = diameters_px
-
-    # Visuals
-    labeled = _draw_outlines(image_bgr, particle_masks)
-    threshold = _make_threshold_image(particle_masks, h, w)
-
-    # Stats — all zero when nothing was detected
-    if len(diameters_mm) > 0:
-        median = float(np.median(diameters_mm))
-        d10, d50, d90 = (float(v) for v in np.percentile(diameters_mm, [10, 50, 90]))
-        fines_pct = float(np.mean(diameters_mm < FINES_RATIO * median) * 100)
-        boulders_pct = float(np.mean(diameters_mm > BOULDERS_RATIO * median) * 100)
-        mean, std = float(np.mean(diameters_mm)), float(np.std(diameters_mm))
-    else:
-        median = mean = std = d10 = d50 = d90 = fines_pct = boulders_pct = 0.0
+    diameters, areas_px, volumes = particle_sizes(particle_masks, pixel_scale)
+    weights, weighting = particle_weights(areas_px, volumes, weighting, pixel_scale)
+    stats = size_stats(diameters, weights)
 
     return AnalysisResult(
-        diameters_mm=diameters_mm,
+        diameters_mm=diameters,
         areas_px=areas_px,
+        volumes_mm3=volumes,
+        weights=weights,
+        weighting=weighting,
         num_particles=int(len(particle_masks)),
         pixel_scale=pixel_scale,
-        labeled_image=labeled,
-        threshold_image=threshold,
-        median_diameter_mm=median,
-        mean_diameter_mm=mean,
-        std_diameter_mm=std,
-        d10_mm=d10,
-        d50_mm=d50,
-        d90_mm=d90,
-        fines_pct=fines_pct,
-        boulders_pct=boulders_pct,
+        labeled_image=_draw_outlines(image_bgr, particle_masks),
+        threshold_image=_make_threshold_image(particle_masks, h, w),
+        median_diameter_mm=stats["d50"],
+        mean_diameter_mm=stats["mean"],
+        std_diameter_mm=stats["std"],
+        d10_mm=stats["d10"],
+        d50_mm=stats["d50"],
+        d90_mm=stats["d90"],
+        d50_se_mm=stats["d50_se"],
+        fines_pct=stats["fines_pct"],
+        boulders_pct=stats["boulders_pct"],
     )
 
 
 def analyze_image(
     image_bgr: np.ndarray,
     pixel_scale: float = 0.0,
-    min_area_px: int = 3,
+    min_area_px: int = 5,
     coin_mask: np.ndarray = None,
+    weighting: str = "available mass",
+    use_sam: bool = False,
 ) -> AnalysisResult:
     """Full pipeline: segment_particles() then measure_particles()."""
-    particle_masks = segment_particles(image_bgr, coin_mask)
-    return measure_particles(image_bgr, particle_masks, pixel_scale)
+    particle_masks = segment_particles(image_bgr, coin_mask, min_area_px=min_area_px, use_sam=use_sam)
+    return measure_particles(image_bgr, particle_masks, pixel_scale, weighting)

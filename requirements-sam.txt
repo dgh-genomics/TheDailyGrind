@@ -1,0 +1,5 @@
+# Optional MobileSAM refinement: segment_particles(use_sam=True) / compare_settings.py --sam
+-r requirements.txt
+torch>=2.0.0
+timm>=0.9.0
+git+https://github.com/ChaoningZhang/MobileSAM.git

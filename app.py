@@ -14,9 +14,11 @@ from grind_analyzer import (
     segment_particles,
     measure_particles,
     find_reference_circle,
+    prepare_image,
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
+    WEIGHTINGS,
     AnalysisResult,
 )
 
@@ -42,6 +44,7 @@ st.markdown("""
     }
     .brew-guide {
         background: #1e1e1e;
+        color: #f0e6d6;
         border-left: 4px solid #c9a96e;
         padding: 1rem;
         border-radius: 0 8px 8px 0;
@@ -77,8 +80,8 @@ def classify_grind(median_mm: float) -> str:
 
 
 def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
-    """Build a Plotly histogram of particle diameters."""
-    d = result.diameters_mm
+    """Build a Plotly histogram of particle diameters, weighted by result.weighting."""
+    d, w = result.diameters_mm, result.weights
     if len(d) <= 1:
         fig = go.Figure()
         fig.add_annotation(text="No particles detected", showarrow=False, font_size=18)
@@ -92,14 +95,20 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
         subplot_titles=("Particle Size Distribution", "Cumulative Distribution"),
     )
 
-    # Histogram
+    # Histogram, as % of total weight. Error bars are counting (Poisson) noise:
+    # a bin built from n grains is uncertain by 1/√n of its height.
     nbins = min(80, max(20, int(np.sqrt(len(d)) * 2)))
+    edges = np.histogram_bin_edges(d, bins=nbins)
+    counts, _ = np.histogram(d, edges)
+    pct = np.histogram(d, edges, weights=w)[0] / np.sum(w) * 100
+    err = np.where(counts > 0, pct / np.sqrt(np.maximum(counts, 1)), 0)
     fig.add_trace(
-        go.Histogram(
-            x=d, nbinsx=nbins,
+        go.Bar(
+            x=(edges[:-1] + edges[1:]) / 2, y=pct, width=np.diff(edges),
+            error_y=dict(type="data", array=err, color="#8b6914", thickness=1, width=0),
             marker_color="#c9a96e", marker_line_color="#8b6914",
             marker_line_width=0.5, opacity=0.85,
-            name="Count",
+            customdata=counts, hovertemplate="%{x:.2f}: %{y:.1f}% (%{customdata} grains)<extra></extra>",
         ),
         row=1, col=1,
     )
@@ -124,8 +133,9 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
         )
 
     # Cumulative
-    sorted_d = np.sort(d)
-    cumulative = np.arange(1, len(sorted_d) + 1) / len(sorted_d) * 100
+    order = np.argsort(d)
+    sorted_d = d[order]
+    cumulative = np.cumsum(w[order]) / np.sum(w) * 100
     fig.add_trace(
         go.Scatter(
             x=sorted_d, y=cumulative,
@@ -145,29 +155,31 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
         margin=dict(t=40, b=40),
     )
     fig.update_xaxes(title_text=f"Particle Diameter ({unit_label})", row=2, col=1)
-    fig.update_yaxes(title_text="Count", row=1, col=1)
+    fig.update_yaxes(title_text=f"% of {result.weighting}", row=1, col=1)
     fig.update_yaxes(title_text="Cumulative %", row=2, col=1)
 
     return fig
 
 
-@st.cache_data(max_entries=4, show_spinner="Running MobileSAM segmentation (first run loads model)…")
+def preview(image: np.ndarray, max_width: int = 1600) -> np.ndarray:
+    """Downscale an image for display (analysis runs at full resolution)."""
+    w = image.shape[1]
+    if w <= max_width:
+        return image
+    return cv2.resize(image, None, fx=max_width / w, fy=max_width / w, interpolation=cv2.INTER_AREA)
+
+
+@st.cache_data(max_entries=4, show_spinner="Detecting particles…")
 def segment_upload(file_bytes: bytes, use_calibration: bool):
     """Decode an upload, find the coin and segment particles.
 
-    Cached on the file bytes, so reruns (any click, changing the reference coin)
-    skip MobileSAM. Returns None if the image can't be decoded.
+    Cached on the file bytes, so reruns (any click, changing the reference coin
+    or weighting) skip segmentation. Returns None if the image can't be decoded.
     """
     image_bgr = cv2.imdecode(np.frombuffer(file_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image_bgr is None:
         return None
-
-    # Downscale very large images for speed
-    h, w = image_bgr.shape[:2]
-    max_dim = 2000
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    image_bgr = prepare_image(image_bgr)
 
     coin_diameter_px, coin_mask = find_reference_circle(image_bgr) if use_calibration else (0.0, None)
     particle_masks = segment_particles(image_bgr, coin_mask)
@@ -192,6 +204,13 @@ with st.sidebar:
 
     use_calibration = st.checkbox("Enable calibration", value=True,
                                   help="Uncheck if there's no reference object in the image")
+
+    st.divider()
+    st.header("⚖️ Size Weighting")
+    weighting = st.selectbox(
+        "Weight particles by", list(WEIGHTINGS), index=0,
+        help="\n\n".join(f"**{k}**: {v}" for k, v in WEIGHTINGS.items()),
+    )
 
     st.divider()
     st.header("🎯 Brew Guide")
@@ -222,23 +241,26 @@ if uploaded is not None:
 
     unit = "mm" if pixel_scale > 0 else "px"
 
-    result = measure_particles(image_bgr, particle_masks, pixel_scale)
+    result = measure_particles(image_bgr, particle_masks, pixel_scale, weighting)
+    if result.weighting != weighting:
+        st.info(f"“{weighting}” needs calibration, so sizes are weighted by {result.weighting}.")
 
     # ── Results ──────────────────────────────────────────────────────────
     st.markdown("---")
 
-    # Metrics row
-    cols = st.columns(8)
+    # Metrics row (D10/D50/D90, mean and fines/boulders are weighted by `weighting`)
+    cols = st.columns([1, 1, 1.8, 1, 1, 1, 1])  # wider D50 column for its ± value
     cols[0].metric("Particles", f"{result.num_particles:,}")
-    cols[1].metric(f"Median ({unit})", f"{result.median_diameter_mm:.2f}")
-    cols[2].metric(f"Mean ({unit})", f"{result.mean_diameter_mm:.2f}")
-    cols[3].metric("D10", f"{result.d10_mm:.2f}")
-    cols[4].metric("D50", f"{result.d50_mm:.2f}")
-    cols[5].metric("D90", f"{result.d90_mm:.2f}")
-    cols[6].metric("Fines", f"{result.fines_pct:.0f}%",
-                   help=f"Share of particles smaller than {FINES_RATIO:g}× the median diameter")
-    cols[7].metric("Boulders", f"{result.boulders_pct:.0f}%",
-                   help=f"Share of particles larger than {BOULDERS_RATIO:g}× the median diameter")
+    cols[1].metric(f"D10 ({unit})", f"{result.d10_mm:.2f}")
+    cols[2].metric(f"D50 ({unit})", f"{result.d50_mm:.2f} ± {result.d50_se_mm:.2f}",
+                   help="± is counting noise: how much D50 moves when this photo's grains are resampled. "
+                        "Photo-to-photo differences (spread, lighting) come on top.")
+    cols[3].metric(f"D90 ({unit})", f"{result.d90_mm:.2f}")
+    cols[4].metric(f"Mean ({unit})", f"{result.mean_diameter_mm:.2f}")
+    cols[5].metric("Fines", f"{result.fines_pct:.0f}%",
+                   help=f"Share of {result.weighting} in grains smaller than {FINES_RATIO:g}× D50")
+    cols[6].metric("Boulders", f"{result.boulders_pct:.0f}%",
+                   help=f"Share of {result.weighting} in grains larger than {BOULDERS_RATIO:g}× D50")
 
     # Brew recommendation
     if result.num_particles == 0:
@@ -266,20 +288,21 @@ if uploaded is not None:
 
     with tab_img:
         # Convert BGR → RGB for display
-        labeled_rgb = cv2.cvtColor(result.labeled_image, cv2.COLOR_BGR2RGB)
+        labeled_rgb = cv2.cvtColor(preview(result.labeled_image), cv2.COLOR_BGR2RGB)
         st.image(labeled_rgb, caption=f"{result.num_particles} particles detected", use_container_width=True)
 
     with tab_thresh:
-        st.image(result.threshold_image, caption="Binary threshold mask (white = coffee)", use_container_width=True)
+        st.image(preview(result.threshold_image), caption="Binary threshold mask (white = coffee)",
+                 use_container_width=True)
 
     # Download CSV
     st.markdown("---")
     import io, csv
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([f"diameter_{unit}", f"area_px"])
-    for d_val, a_val in zip(result.diameters_mm, result.areas_px):
-        writer.writerow([f"{d_val:.4f}", f"{a_val:.1f}"])
+    writer.writerow([f"diameter_{unit}", "area_px", f"volume_{unit}3", f"weight_{result.weighting.replace(' ', '_')}"])
+    for d_val, a_val, v_val, w_val in zip(result.diameters_mm, result.areas_px, result.volumes_mm3, result.weights):
+        writer.writerow([f"{d_val:.4f}", f"{a_val:.1f}", f"{v_val:.6g}", f"{w_val:.6g}"])
     st.download_button(
         "📥 Download particle data (CSV)",
         data=buf.getvalue(),
