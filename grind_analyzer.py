@@ -12,10 +12,12 @@ densely the grounds are spread:
 """
 
 import cv2
+import io
 import numpy as np
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from PIL import ExifTags, Image
 from scipy import ndimage as ndi
 from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
@@ -79,6 +81,9 @@ SPLIT_RATIO = 0.5
 # coffeegrindsize's extraction model: water reaches ~0.1 mm into each grain
 EXTRACTION_DEPTH_MM = 0.1
 
+# Lenses shorter than this (35 mm-equivalent) are ultra-wide; main cameras are ~23–28 mm
+ULTRAWIDE_MAX_MM = 20
+
 WEIGHTINGS = {
     "available mass": "Mass that water can reach (outer 0.1 mm of each grain), coffeegrindsize's default",
     "mass":           "Grain volume, comparable to sieve or laser-diffraction results",
@@ -130,6 +135,33 @@ def prepare_image(image_bgr: np.ndarray, max_dim: int = MAX_IMAGE_DIM) -> np.nda
         return image_bgr
     scale = max_dim / max(h, w)
     return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def capture_warnings(photo) -> list:
+    """
+    Warnings about how a photo was taken, read from its EXIF data. `photo` is a
+    file path or the file's bytes. In testing, shots with the flash and the
+    ultra-wide lens (which phone macro modes switch to) read grains 7–16% smaller
+    than main-camera shots of the same spread. Returns [] when there is no EXIF
+    data (screenshots, photos sent through messaging apps).
+    """
+    try:
+        source = io.BytesIO(photo) if isinstance(photo, (bytes, bytearray)) else photo
+        with Image.open(source) as im:
+            exif = im.getexif().get_ifd(ExifTags.IFD.Exif)
+    except Exception:
+        return []
+
+    found = []
+    flash = exif.get(ExifTags.Base.Flash)
+    if flash is not None and int(flash) & 1:  # bit 0: flash fired
+        found.append("The flash fired. Flash shots read smaller in testing (glare on the grains); "
+                     "turn the flash off.")
+    focal = exif.get(ExifTags.Base.FocalLengthIn35mmFilm)
+    if focal and int(focal) < ULTRAWIDE_MAX_MM:
+        found.append(f"Taken with the ultra-wide lens ({int(focal)} mm equivalent), which macro mode uses. "
+                     "These shots read smaller in testing; use the main 1× camera.")
+    return found
 
 
 def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np.ndarray:
@@ -459,20 +491,28 @@ def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (9, 9), 2)
     s = min(small.shape)
+    # Small minDist: in a dense spread, spurious circles through the grains can
+    # out-vote the coin and would otherwise suppress it as a near neighbour
     circles = cv2.HoughCircles(
-        small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=int(s * 0.1),
+        small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(5, int(s * 0.02)),
         param1=100, param2=40, minRadius=int(s * 0.03), maxRadius=int(s * 0.4),
     )
     if circles is None:
         return 0.0, None
 
     # The coin is the candidate whose edge is consistent all the way round;
-    # clusters of grains can form Hough circles but not a clean edge
+    # circles through grains score ~0.1–0.2, real coins ~0.6–1.0
+    # Quick 60-ray score for every candidate, full fit for the best few
     gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    coarse = []
+    for x, y, r in circles[0]:
+        fit = _refine_coin_edge(gray_f, x / f, y / f, r / f, n_rays=60)
+        if fit is not None:
+            coarse.append((fit[3], x / f, y / f, r / f))
     best = None
-    for x, y, r in circles[0][:10]:
-        fit = _refine_coin_edge(gray_f, x / f, y / f, r / f)
-        if fit is not None and fit[3] >= 0.6 and (best is None or fit[3] > best[3]):
+    for _, x, y, r in sorted(coarse, reverse=True)[:5]:
+        fit = _refine_coin_edge(gray_f, x, y, r)
+        if fit is not None and fit[3] >= 0.5 and (best is None or fit[3] > best[3]):
             best = fit
     if best is None:
         return 0.0, None

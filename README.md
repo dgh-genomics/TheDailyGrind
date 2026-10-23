@@ -34,8 +34,10 @@ pip install -r requirements-sam.txt
 
 1. **Spread** grounds in a thin, single layer on white paper
 2. **Place** a reference coin (e.g., US Quarter) in the frame
-3. **Photograph** straight down with even, diffuse lighting
-4. **Avoid** shadows, piled-up grounds, and glossy surfaces
+3. **Photograph** straight down with even, diffuse lighting, using the main (1×) camera
+4. **Avoid** the flash, macro mode (it switches to the ultra-wide lens), shadows, piled-up grounds, and glossy surfaces
+
+In testing, flash / ultra-wide shots read grains 7–16% smaller than main-camera shots of the same spread; the app and `compare_settings.py` warn when a photo's EXIF data shows either.
 
 Use your camera's full resolution (photos are analyzed at up to 4000 px). With available-mass or surface weighting, the number of grains limits precision more than magnification does: a photo with a few hundred grains has a D50 uncertainty of ±5–7%, so shoot from far enough to fit a dense spread of a few thousand grains rather than a close-up. Count weighting depends on how many fines the camera resolves, so it shifts with camera distance. HEIC photos must be converted to JPEG for the comparison script.
 

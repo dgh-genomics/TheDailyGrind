@@ -15,6 +15,7 @@ from grind_analyzer import (
     measure_particles,
     find_reference_circle,
     prepare_image,
+    capture_warnings,
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
@@ -238,6 +239,8 @@ if uploaded is not None:
             st.success(f"Calibrated: **{pixel_scale:.4f} mm/px** using {ref_choice}")
         else:
             st.warning("Could not detect a circular reference object. Showing results in pixels.")
+    for warning in capture_warnings(uploaded.getvalue()):
+        st.warning(warning, icon="📷")
 
     unit = "mm" if pixel_scale > 0 else "px"
 
