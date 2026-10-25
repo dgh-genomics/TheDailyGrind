@@ -26,6 +26,7 @@ from grind_analyzer import (
     WEIGHTINGS,
     AnalysisResult,
 )
+from measurement_log import BREW_METHODS, TASTES, append_record, build_record, log_path
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -326,6 +327,38 @@ if uploaded is not None:
         file_name="grind_analysis.csv",
         mime="text/csv",
     )
+
+    # Save to the local measurement log (see measurement_log.py)
+    with st.expander("📝 Save this measurement"):
+        st.caption(f"Adds one line to `{log_path()}` on this computer: the sizes (available-mass weighting), "
+                   "the phone model and camera mode from the photo, and what you enter here. "
+                   "The photo itself and its location are not saved.")
+        with st.form("save_measurement"):
+            c1, c2 = st.columns(2)
+            bean = c1.text_input("Bean / roast", key="log_bean", placeholder="e.g. Ethiopia Guji, roasted 2026-10-20")
+            grinder = c2.text_input("Grinder", key="log_grinder", placeholder="e.g. Baratza Encore")
+            setting = c1.text_input("Grinder setting", key="log_setting")
+            method = c2.selectbox("Brew method", BREW_METHODS, key="log_method")
+            dose = c1.number_input("Dose (g)", min_value=0.0, step=0.5, key="log_dose")
+            water = c2.number_input("Water (g)", min_value=0.0, step=10.0, key="log_water")
+            taste = c1.selectbox("How did it taste?", TASTES, key="log_taste")
+            tds = c2.number_input("TDS % (0 = not measured)", min_value=0.0, max_value=30.0, step=0.01,
+                                  format="%.2f", key="log_tds")
+            notes = st.text_input("Notes", key="log_notes")
+            if st.form_submit_button("Save"):
+                logged = result if result.weighting == "available mass" else \
+                    measure_particles(image_bgr, particle_masks, pixel_scale, "available mass")
+                context = {
+                    "bean": bean or None, "grinder": grinder or None, "setting": setting or None,
+                    "brew_method": method, "dose_g": dose or None, "water_g": water or None,
+                    "taste": taste, "tds_pct": tds or None, "notes": notes or None,
+                    "reference_object": ref_choice if pixel_scale > 0 else None,
+                }
+                warnings_all = (capture_warnings(uploaded.getvalue()) + lighting_warnings(evenness)
+                                + spread_warnings(logged.clumped_pct))
+                record = build_record(uploaded.getvalue(), logged, coin_diameter_px=coin_diameter_px,
+                                      evenness=evenness, warnings=warnings_all, context=context)
+                st.success(f"Saved. `{log_path()}` now holds {append_record(record)} measurement(s).")
 
 else:
     # Landing page

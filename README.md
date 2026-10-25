@@ -2,7 +2,7 @@
 
 Measure your coffee grind from a phone photo. Spread a pinch of grounds on white paper next to a coin, take a photo, and get the grind size distribution (D10 / D50 / D90, fines, boulders) in seconds.
 
-> **Status: early prototype.** Validated so far on one bean, one grinder and one phone (see [How well does it work?](#how-well-does-it-work)). Feedback, especially photos from other phones and grinders, is very welcome.
+> **Status: early prototype.** Validated so far on one bean, one grinder and one phone (see [How well does it work?](#how-well-does-it-work)). Feedback is very welcome, especially [saved measurements](#saving-your-measurements) from other phones, grinders and brewers.
 
 ## Try it (about 5 minutes)
 
@@ -76,6 +76,19 @@ Photos sent through messaging apps usually lose their EXIF data, so the camera w
 - **CSV**: one row per measured grain (diameter, area, volume, weight).
 
 Sizes are only comparable when photos are taken the same way (same phone and camera mode, similar spread and light).
+
+## Saving your measurements
+
+Below the results, **📝 Save this measurement** adds one line to `measurements.jsonl`, in the folder you started the app from. Set the `TDG_MEASUREMENT_LOG` environment variable to use a different file. Each line records:
+
+- **the measurement:** available-mass D10 / D50 / D90, clump-adjusted D50, fines, share of coffee under 0.6 mm, clumping, lighting evenness and grain count;
+- **how the photo was taken:** phone make and model, lens, zoom and flash (from the photo's EXIF), and when it was taken;
+- **what you enter:** bean / roast, grinder and setting, brew method, dose, water, taste, TDS and notes;
+- **for traceability:** the app version, and a fingerprint of the photo so duplicates can be spotted.
+
+It never stores the photo or its location (GPS). The file stays on your computer and is git-ignored.
+
+**Helping test?** Your `measurements.jsonl`, with honest taste entries, is the most useful thing to send back. Across phones, grinders and brewers, these records are what will show how much each one matters.
 
 ## Comparing grinder settings
 

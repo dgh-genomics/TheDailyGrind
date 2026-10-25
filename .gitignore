@@ -8,3 +8,4 @@ mobile_sam.pt
 dist/
 build/
 .DS_Store
+measurements.jsonl
