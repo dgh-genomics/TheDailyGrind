@@ -570,44 +570,77 @@ def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     """Try to auto-detect a circular reference object. Returns (diameter_px, coin_mask)."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
+    gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    # Relative to the local paper, so shadow edges fade and a shaded coin edge counts fully
+    gray_norm = _normalize_to_paper(cv2.merge([gray, gray, gray]))
+    gray_rel = cv2.GaussianBlur(gray_norm, (0, 0), 1.0)
 
-    # Find candidates on a ~1000 px copy (fast); the edge fit restores full precision
-    f = min(1.0, 1000 / max(h, w))
-    small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-    small = cv2.GaussianBlur(small, (9, 9), 2)
-    s = min(small.shape)
+    # Search the raw image first; if no coin is found, search the paper-normalized
+    # one, where hand / phone shadow edges no longer swamp the coin
+    best = _best_coin_fit(gray, gray_f, gray_rel)
+    if best is None:
+        best = _best_coin_fit(np.clip(gray_norm * 200, 0, 255).astype(np.uint8), gray_f, gray_rel)
+    if best is None:
+        return 0.0, None
+
+    center, (a1, a2), angle, _ = best
+    coin_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(coin_mask, (center, (a1 * 1.1, a2 * 1.1), angle), 255, -1)
+
+    # Equivalent-area diameter: the right average scale if the coin looks oval
+    return float(np.sqrt(a1 * a2)), coin_mask
+
+
+def _best_coin_fit(source: np.ndarray, gray_f: np.ndarray, gray_rel: np.ndarray):
+    """Hough candidates in `source`, scored on the full-resolution images. Returns the coin fit or None."""
+    # Candidates on a ~1000 px copy (fast); the edge fit restores full precision.
     # Small minDist: in a dense spread, spurious circles through the grains can
-    # out-vote the coin and would otherwise suppress it as a near neighbour
+    # out-vote the coin and would otherwise suppress it as a near neighbour.
+    h, w = source.shape
+    f = min(1.0, 1000 / max(h, w))
+    small = cv2.GaussianBlur(cv2.resize(source, None, fx=f, fy=f, interpolation=cv2.INTER_AREA), (9, 9), 2)
+    s = min(small.shape)
     circles = cv2.HoughCircles(
         small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=max(5, int(s * 0.02)),
         param1=100, param2=40, minRadius=int(s * 0.03), maxRadius=int(s * 0.4),
     )
     if circles is None:
-        return 0.0, None
+        return None
+    candidates = circles[0] / f
 
     # The coin is the candidate with a clean edge all the way round. Two scores:
     # consistency (paper-side crossings agree; circles through grains ~0.1–0.2,
-    # coins ~0.5–1.0) and edge support (still high when grounds are piled
+    # coins ~0.3–1.0) and edge support (still high when grounds are piled
     # against the coin; circles through grains up to ~0.75). Quick 60-ray scores
     # for every candidate, full scores for the best few.
-    gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
-    # Edge strength relative to the local paper, so a coin half in shadow still scores
-    gray_rel = cv2.GaussianBlur(_normalize_to_paper(cv2.merge([gray, gray, gray])), (0, 0), 1.0)
     coarse = []
-    for x, y, r in circles[0]:
-        fit = _refine_coin_edge(gray_f, x / f, y / f, r / f, n_rays=60)
+    for x, y, r in candidates:
+        fit = _refine_coin_edge(gray_f, x, y, r, n_rays=60)
         if fit is not None:
-            coarse.append((fit[3] + _edge_support(gray_rel, *fit[:3], n_rays=60), x / f, y / f, r / f))
-    accepted = []
+            coarse.append((fit[3] + _edge_support(gray_rel, *fit[:3], n_rays=60), x, y, r))
+    scored = []
     for _, x, y, r in sorted(coarse, reverse=True)[:8]:
         fit = _refine_coin_edge(gray_f, x, y, r)
-        if fit is None:
-            continue
-        support = _edge_support(gray_rel, *fit[:3])
-        if fit[3] >= 0.5 or support >= 0.85:
-            accepted.append((fit[3] + support, fit))
+        if fit is not None:
+            support = _edge_support(gray_rel, *fit[:3])
+            scored.append((fit[3] + support, support, fit))
+    if not scored:
+        return None
+    scored.sort(key=lambda s: -s[0])
+
+    # Accept a clean edge (consistency >= 0.5 or support >= 0.85), or a top
+    # candidate that clearly beats every circle not centred on it: a coin half
+    # in shadow and ringed by grounds. Over 26 real photos, coins scored >= 1.12
+    # with a lead >= 0.14; spurious tops scored < 0.9 with a lead < 0.05.
+    top_score, _, top = scored[0]
+    top_r = np.sqrt(top[1][0] * top[1][1]) / 2
+    runner_up = max((sc for sc, _, fit in scored[1:]
+                     if np.hypot(fit[0][0] - top[0][0], fit[0][1] - top[0][1]) >= 0.1 * top_r), default=0.0)
+    accepted = [(sc, fit) for sc, support, fit in scored if fit[3] >= 0.5 or support >= 0.85]
+    if top_score >= 1.05 and top_score - runner_up >= 0.2:
+        accepted.append((top_score, top))
     if not accepted:
-        return 0.0, None
+        return None
 
     best = max(accepted, key=lambda s: s[0])[1]
     # The coin's raised rim can fit a smaller concentric circle; keep the outer edge
@@ -616,13 +649,7 @@ def find_reference_circle(image_bgr: np.ndarray) -> tuple:
         offset = np.hypot(fit[0][0] - best[0][0], fit[0][1] - best[0][1])
         if offset < 0.1 * best_r and fit[1][0] * fit[1][1] > best[1][0] * best[1][1]:
             best = fit
-
-    center, (a1, a2), angle, _ = best
-    coin_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.ellipse(coin_mask, (center, (a1 * 1.1, a2 * 1.1), angle), 255, -1)
-
-    # Equivalent-area diameter: the right average scale if the coin looks oval
-    return float(np.sqrt(a1 * a2)), coin_mask
+    return best
 
 
 def detect_reference_circle(image_bgr: np.ndarray, known_diameter_mm: float) -> tuple:
