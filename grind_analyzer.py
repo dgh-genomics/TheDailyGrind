@@ -1,14 +1,20 @@
 """
 Coffee Grind Size Analyzer — Core Image Processing
 
-Every particle is measured the same way, so results don't depend on how
-densely the grounds are spread:
-  1. Blue channel divided by a smooth estimate of the paper brightness
-  2. Threshold at 58.8% of the paper (as coffeegrindsize does) — about half-way
+Pipeline (every grain is measured the same way, whatever the spread density):
+  1. Coin calibration: Hough candidates (retried on a shadow-free copy if
+     needed), edge measured along 360 rays, ellipse fit -> mm per pixel
+  2. Blue channel divided by a smooth estimate of the paper brightness
+  3. Threshold at 58.8% of the paper (as coffeegrindsize does) — about half-way
      between coffee and paper, so blurred edges are neither grown nor shrunk
-  3. Distance-transform watershed splits touching grains
-  4. Grains cut off by the image edge or the coin are dropped
-  5. Optional: MobileSAM refines larger grains (pip install -r requirements-sam.txt)
+  4. Distance-transform watershed splits touching grains at narrow necks
+  5. Grains cut off by the image edge or the coin are dropped
+  6. Clumps (touching grains the splitter couldn't separate) are flagged and left
+     out of the size statistics; clumped_pct reports how much coffee they hold
+  7. Optional: MobileSAM refines larger grains (pip install -r requirements-sam.txt)
+
+Photo-quality checks, each with a *_warnings() helper: camera (flash or
+ultra-wide lens, from EXIF), spread (clumping) and lighting (shadows).
 """
 
 import cv2
@@ -29,14 +35,15 @@ class AnalysisResult:
     """Results from a grind size analysis.
 
     Sizes are in mm when calibrated (pixel_scale > 0), otherwise in px.
-    Percentiles, mean, std and fines/boulders are weighted by `weighting`.
+    Percentiles, mean, std and fines/boulders are weighted by `weighting` and,
+    by default, computed from single grains only (clumps excluded).
     """
-    diameters_mm: np.ndarray   # equivalent-circle diameter of each particle
+    diameters_mm: np.ndarray   # equivalent-circle diameter of each measured particle
     areas_px: np.ndarray
     volumes_mm3: np.ndarray    # ellipsoid volume of each particle (px³ if uncalibrated)
     weights: np.ndarray        # each particle's weight under `weighting`
     weighting: str
-    num_particles: int
+    num_particles: int         # particles measured (single grains unless exclude_clumps=False)
     pixel_scale: float
     labeled_image: np.ndarray
     threshold_image: np.ndarray
@@ -90,6 +97,11 @@ ULTRAWIDE_MAX_MM = 20
 # hold more than CLUMP_WARN_PCT of the grain area (good spreads: ~1–15%).
 CLUMP_SOLIDITY = 0.7
 CLUMP_WARN_PCT = 20
+
+# Size statistics leave clumps out by default. Even then, D50 of the single
+# grains still rose ~0.44% per point of clumping across 8 spreads of one bean
+# (settings 3–5); clump_adjusted() removes that. Provisional: one bean, one phone.
+CLUMP_ADJUST_PER_PCT = 0.0044
 
 # Matched grains read +6% larger in diameter where the paper was 10–30% darker
 # than in direct light, and +11.5% where it was over 30% darker. Warn when part
@@ -176,30 +188,44 @@ def capture_warnings(photo) -> list:
     return found
 
 
-def clumped_percent(particle_masks: list, min_area_px: int = 100) -> float:
+def clump_flags(particle_masks: list, min_area_px: int = 100) -> np.ndarray:
     """
-    Share of grain area (%) in clump-shaped particles: touching grains that read
-    as one large grain. Particles under min_area_px are skipped (too few pixels
-    for a meaningful shape).
+    True for clump-shaped particles: touching grains the splitter couldn't
+    separate, which read as one large grain. Particles under min_area_px are
+    never flagged (too few pixels for a meaningful shape).
     """
-    total = clumped = 0
-    for m in particle_masks:
+    flags = np.zeros(len(particle_masks), bool)
+    for i, m in enumerate(particle_masks):
         if m["area"] < min_area_px:
             continue
         hull = cv2.convexHull(cv2.findNonZero(m["segmentation"].astype(np.uint8)))
         # Hull contour runs through pixel centres; add half its perimeter for pixel area
         hull_area = cv2.contourArea(hull) + 0.5 * cv2.arcLength(hull, True) + 1
-        total += m["area"]
-        if m["area"] / hull_area < CLUMP_SOLIDITY:
-            clumped += m["area"]
-    return 100.0 * clumped / total if total else 0.0
+        flags[i] = m["area"] / hull_area < CLUMP_SOLIDITY
+    return flags
+
+
+def clumped_percent(particle_masks: list, flags: np.ndarray = None, min_area_px: int = 100) -> float:
+    """Share of grain area (%) in clump-shaped particles, among particles of at least min_area_px."""
+    if flags is None:
+        flags = clump_flags(particle_masks, min_area_px)
+    areas = np.array([m["area"] for m in particle_masks], dtype=np.float64)
+    shaped = areas >= min_area_px
+    total = areas[shaped].sum()
+    return float(100.0 * areas[flags].sum() / total) if total else 0.0
+
+
+def clump_adjusted(value: float, clumped_pct: float) -> float:
+    """A single-grain size statistic adjusted to 0% clumping (provisional; see CLUMP_ADJUST_PER_PCT)."""
+    return float(value * np.exp(-CLUMP_ADJUST_PER_PCT * clumped_pct))
 
 
 def spread_warnings(clumped_pct: float) -> list:
     """Warnings about how the grounds were spread."""
     if clumped_pct > CLUMP_WARN_PCT:
-        return [f"{clumped_pct:.0f}% of the coffee is in clumps of touching grains, which read as single "
-                "large grains. Spread thinner so most grains have paper around them."]
+        return [f"{clumped_pct:.0f}% of the coffee is in clumps of touching grains. Clumps are left out of the "
+                "sizes, but fewer grains get measured and some bias remains. Spread thinner so most grains "
+                "have paper around them."]
     return []
 
 
@@ -466,18 +492,21 @@ def _axis_ratio(mask) -> float:
     return float(np.clip(np.sqrt(ev[0] / ev[1]), 0.1, 1.0))
 
 
-def _draw_outlines(image_bgr: np.ndarray, masks: list) -> np.ndarray:
-    """Draw randomly coloured outlines (so split grains stand out) on the image."""
+def _draw_outlines(image_bgr: np.ndarray, masks: list, clumps: np.ndarray = None) -> np.ndarray:
+    """Draw randomly coloured outlines (so split grains stand out); clumps in thick red."""
     output = image_bgr.copy()
     rng = np.random.RandomState(42)
-    for mask in masks:
+    for i, mask in enumerate(masks):
         # 1-px zero border so particles touching the crop edge get closed contours
         seg = np.pad(mask["segmentation"], 1).astype(np.uint8) * 255
         x0, y0 = mask["bbox"][:2]
         contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
                                        offset=(int(x0) - 1, int(y0) - 1))
         color = rng.randint(80, 255, size=3).tolist()
-        cv2.drawContours(output, contours, -1, color, 1)
+        if clumps is not None and clumps[i]:
+            cv2.drawContours(output, contours, -1, (0, 0, 255), 3)
+        else:
+            cv2.drawContours(output, contours, -1, color, 1)
     return output
 
 
@@ -752,11 +781,19 @@ def measure_particles(
     particle_masks: list,
     pixel_scale: float = 0.0,
     weighting: str = "available mass",
+    exclude_clumps: bool = True,
 ) -> AnalysisResult:
-    """Measure segmented particles and compute weighted statistics (fast)."""
+    """
+    Measure segmented particles and compute weighted statistics (fast). By
+    default clump-shaped particles (merged touching grains) are left out of the
+    size statistics: on 8 spreads at settings 3–5 this halved the error of D50
+    against grinder setting. They still count toward clumped_pct.
+    """
     h, w = image_bgr.shape[:2]
 
-    diameters, areas_px, volumes = particle_sizes(particle_masks, pixel_scale)
+    clumps = clump_flags(particle_masks)
+    singles = [m for m, c in zip(particle_masks, clumps) if not c] if exclude_clumps else particle_masks
+    diameters, areas_px, volumes = particle_sizes(singles, pixel_scale)
     weights, weighting = particle_weights(areas_px, volumes, weighting, pixel_scale)
     stats = size_stats(diameters, weights)
 
@@ -766,9 +803,9 @@ def measure_particles(
         volumes_mm3=volumes,
         weights=weights,
         weighting=weighting,
-        num_particles=int(len(particle_masks)),
+        num_particles=int(len(singles)),
         pixel_scale=pixel_scale,
-        labeled_image=_draw_outlines(image_bgr, particle_masks),
+        labeled_image=_draw_outlines(image_bgr, particle_masks, clumps),
         threshold_image=_make_threshold_image(particle_masks, h, w),
         median_diameter_mm=stats["d50"],
         mean_diameter_mm=stats["mean"],
@@ -779,7 +816,7 @@ def measure_particles(
         d50_se_mm=stats["d50_se"],
         fines_pct=stats["fines_pct"],
         boulders_pct=stats["boulders_pct"],
-        clumped_pct=clumped_percent(particle_masks),
+        clumped_pct=clumped_percent(particle_masks, clumps),
     )
 
 

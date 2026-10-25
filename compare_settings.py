@@ -20,8 +20,20 @@ For each size weighting it reports:
     the separation to 3 (about 7% mix-ups)
   - leave-one-out: how often each photo lands on its true setting (or within ±1)
 
-Writes to --out: photos.csv (one row per photo), particles/<setting>/... .csv
-(one row per grain), and report.html (plots).
+Sizes come from single grains (clumps of touching grains are left out). A final
+block repeats the available-mass analysis with D50 adjusted to no clumping, using
+how D50 moves with clumping within settings in this experiment (or the
+provisional default when clumping barely varies).
+
+Each photo is checked for flash / ultra-wide lens (EXIF), clumping and uneven
+light; warnings are printed and listed in the report.
+
+Writes to --out: photos.csv (one row per photo, incl. clumped_pct,
+lighting_evenness_pct and warnings), particles/<setting>/... .csv (one row per
+single grain), and report.html (plots).
+
+Note: repeat photos of one spread share the same grains, so they understate the
+spread-to-spread scatter; use separate spreads (and grinds) as replicates.
 
 HEIC photos (iPhone default) must be converted to JPEG first.
 """
@@ -84,8 +96,11 @@ def measure_photo(path: Path, args):
         scale = args.coin_mm / coin_px
 
     particles = ga.segment_particles(image, coin_mask, threshold=args.threshold, use_sam=args.sam)
-    return (scale, ga.clumped_percent(particles), ga.lighting_evenness(image, coin_mask),
-            *ga.particle_sizes(particles, scale))
+    # Sizes come from single grains; clumps (merged touching grains) only count toward clumped_pct
+    clumps = ga.clump_flags(particles)
+    singles = [p for p, c in zip(particles, clumps) if not c]
+    return (scale, ga.clumped_percent(particles, clumps), ga.lighting_evenness(image, coin_mask),
+            *ga.particle_sizes(singles, scale))
 
 
 def normal_cdf(x: float) -> float:
@@ -98,6 +113,28 @@ def pooled_sd(groups: list) -> float:
     if dof == 0:
         return float("nan")
     return math.sqrt(sum((len(g) - 1) * np.var(g, ddof=1) for g in groups if len(g) > 1) / dof)
+
+
+def clump_coefficient(rows: list, key: str) -> tuple:
+    """
+    Slope of log(key) on clumped_pct within settings (pooled), so it is not
+    confounded with the settings themselves. Falls back to the provisional
+    default when clumping barely varies within settings.
+    """
+    xs, ys = [], []
+    for setting in dict.fromkeys(r["setting"] for r in rows):
+        sel = [r for r in rows if r["setting"] == setting]
+        if len(sel) > 1:
+            x = np.array([r["clumped_pct"] for r in sel])
+            y = np.log([r[key] for r in sel])
+            xs.append(x - x.mean())
+            ys.append(y - y.mean())
+    if xs:
+        x, y = np.concatenate(xs), np.concatenate(ys)
+        dof = len(x) - len(xs)
+        if dof >= 6 and np.sum(x ** 2) >= 50:
+            return float(np.sum(x * y) / np.sum(x ** 2)), f"fitted on this experiment, {dof} within-setting d.o.f."
+    return ga.CLUMP_ADJUST_PER_PCT, "provisional default; clumping varies too little within settings here"
 
 
 def summarize(rows: list, weighting: str) -> dict:
@@ -211,7 +248,7 @@ def make_report(rows: list, particles: dict, summaries: list, best: str, unit: s
         d = np.concatenate([p[0] for p in particles[s]])
         a = np.concatenate([p[1] for p in particles[s]])
         v = np.concatenate([p[2] for p in particles[s]])
-        w, _ = ga.particle_weights(a, v, best, pixel_scale=1.0)  # sizes are already in mm
+        w, _ = ga.particle_weights(a, v, best.split(",")[0], pixel_scale=1.0)  # sizes are already in mm
         order = np.argsort(d)
         cdf.add_trace(go.Scatter(x=d[order], y=np.cumsum(w[order]) / w.sum() * 100, mode="lines",
                                  name=f"setting {s}", line=dict(color=color, width=2)))
@@ -291,7 +328,19 @@ def main():
         writer.writerows(rows)
 
     summaries = [summarize(rows, w) for w in ga.WEIGHTINGS]
-    text = "\n\n".join(format_summary(s, unit) for s in summaries)
+
+    # Clump covariate: how D50 moves with clumping within each setting, from this
+    # experiment if clumping varies enough, else the provisional default
+    coef, source = clump_coefficient(rows, "d50_available mass")
+    adjusted = "available mass, clump-adjusted"
+    for r in rows:
+        factor = math.exp(-coef * r["clumped_pct"])
+        r[f"d50_{adjusted}"] = round(r["d50_available mass"] * factor, 5)
+        r[f"d50_se_{adjusted}"] = round(r["d50_se_available mass"] * factor, 5)
+    summaries.append(summarize(rows, adjusted))
+    text = (f"Clump adjustment: D50 changes {100 * coef:+.2f}% per point of clumping ({source}); "
+            "the last block shows available-mass D50 adjusted to no clumping.\n\n")
+    text += "\n\n".join(format_summary(s, unit) for s in summaries)
     seps = {s["weighting"]: np.nanmedian([p["separation"] for p in s["pairs"]]) for s in summaries}
     best = max(seps, key=lambda k: -1 if math.isnan(seps[k]) else seps[k])
     verdict = (f"Best weighting: {best} (median neighbour separation {seps[best]:.1f}× the photo-to-photo SD; "

@@ -17,6 +17,7 @@ from grind_analyzer import (
     prepare_image,
     capture_warnings,
     spread_warnings,
+    clump_adjusted,
     lighting_evenness,
     lighting_warnings,
     REFERENCE_OBJECTS,
@@ -272,6 +273,11 @@ if uploaded is not None:
                    help=f"Share of {result.weighting} in grains smaller than {FINES_RATIO:g}× D50")
     cols[6].metric("Boulders", f"{result.boulders_pct:.0f}%",
                    help=f"Share of {result.weighting} in grains larger than {BOULDERS_RATIO:g}× D50")
+    if result.clumped_pct >= 1 and result.num_particles:
+        st.caption(f"{result.clumped_pct:.0f}% of the coffee is in clumps of touching grains (red outlines), "
+                   f"left out of the sizes above. Adjusted to no clumping, D50 ≈ "
+                   f"{clump_adjusted(result.d50_mm, result.clumped_pct):.2f} {unit} "
+                   "(provisional adjustment, measured on one bean).")
 
     # Brew recommendation
     if result.num_particles == 0:
