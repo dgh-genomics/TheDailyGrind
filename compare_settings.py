@@ -67,7 +67,7 @@ def find_photos(root: Path) -> list:
 
 
 def measure_photo(path: Path, args):
-    """Segment one photo. Returns (mm_per_px, diameters, areas_px, volumes) or None."""
+    """Segment one photo. Returns (mm_per_px, clumped_pct, diameters, areas_px, volumes) or None."""
     image = cv2.imread(str(path))
     if image is None:
         print(f"  ! could not read {path}")
@@ -84,7 +84,7 @@ def measure_photo(path: Path, args):
         scale = args.coin_mm / coin_px
 
     particles = ga.segment_particles(image, coin_mask, threshold=args.threshold, use_sam=args.sam)
-    return (scale, *ga.particle_sizes(particles, scale))
+    return (scale, ga.clumped_percent(particles), *ga.particle_sizes(particles, scale))
 
 
 def normal_cdf(x: float) -> float:
@@ -252,15 +252,16 @@ def main():
         measured = measure_photo(photo["path"], args)
         if measured is None:
             continue
-        scale, d, a, v = measured
+        scale, clumped, d, a, v = measured
         if len(d) < MIN_PARTICLES:
             print(f"  ! only {len(d)} grains in {photo['path'].name}; skipped")
             continue
-        warnings = ga.capture_warnings(photo["path"])
+        warnings = ga.capture_warnings(photo["path"]) + ga.spread_warnings(clumped)
         for warning in warnings:
             print(f"  ! {photo['path'].name}: {warning}")
         row = dict(setting=photo["setting"], sample=photo["sample"], photo=photo["path"].name,
-                   n_particles=len(d), mm_per_px=round(scale, 6), capture_warnings=" | ".join(warnings))
+                   n_particles=len(d), mm_per_px=round(scale, 6), clumped_pct=round(clumped, 1),
+                   warnings=" | ".join(warnings))
         for weighting in ga.WEIGHTINGS:
             w, _ = ga.particle_weights(a, v, weighting, scale)
             stats = ga.size_stats(d, w)
@@ -294,10 +295,11 @@ def main():
     verdict = (f"Best weighting: {best} (median neighbour separation {seps[best]:.1f}× the photo-to-photo SD; "
                f"aim for ≥ {TARGET_SEPARATION:g}).")
     text += "\n\n" + verdict
-    flagged = [r["photo"] for r in rows if r["capture_warnings"]]
+    flagged = [r["photo"] for r in rows if r["warnings"]]
     if flagged:
-        text += (f"\n\n{len(flagged)} of {len(rows)} photos used the flash or the ultra-wide lens and are included "
-                 f"above: {', '.join(flagged)}. These read smaller in testing; consider reshooting them.")
+        text += (f"\n\n{len(flagged)} of {len(rows)} photos have warnings (flash, ultra-wide lens or clumped "
+                 f"grains) and are included above: {', '.join(flagged)}. Their sizes are biased; consider "
+                 "reshooting them. See the warnings column in photos.csv.")
     print("\n" + text)
 
     (args.out / "report.html").write_text(make_report(rows, particles, summaries, best, unit, text))

@@ -49,6 +49,7 @@ class AnalysisResult:
     d50_se_mm: float           # bootstrap standard error of D50 (particle counting noise)
     fines_pct: float
     boulders_pct: float
+    clumped_pct: float         # share of grain area in clumps of touching grains
 
 
 REFERENCE_OBJECTS = {
@@ -83,6 +84,12 @@ EXTRACTION_DEPTH_MM = 0.1
 
 # Lenses shorter than this (35 mm-equivalent) are ultra-wide; main cameras are ~23–28 mm
 ULTRAWIDE_MAX_MM = 20
+
+# Particles less solid than this (area / convex hull) are clumps of touching grains
+# the splitter couldn't separate; single grains are ~0.85–0.95. Warn when clumps
+# hold more than CLUMP_WARN_PCT of the grain area (good spreads: ~1–15%).
+CLUMP_SOLIDITY = 0.7
+CLUMP_WARN_PCT = 20
 
 WEIGHTINGS = {
     "available mass": "Mass that water can reach (outer 0.1 mm of each grain), coffeegrindsize's default",
@@ -162,6 +169,33 @@ def capture_warnings(photo) -> list:
         found.append(f"Taken with the ultra-wide lens ({int(focal)} mm equivalent), which macro mode uses. "
                      "These shots read smaller in testing; use the main 1× camera.")
     return found
+
+
+def clumped_percent(particle_masks: list, min_area_px: int = 100) -> float:
+    """
+    Share of grain area (%) in clump-shaped particles: touching grains that read
+    as one large grain. Particles under min_area_px are skipped (too few pixels
+    for a meaningful shape).
+    """
+    total = clumped = 0
+    for m in particle_masks:
+        if m["area"] < min_area_px:
+            continue
+        hull = cv2.convexHull(cv2.findNonZero(m["segmentation"].astype(np.uint8)))
+        # Hull contour runs through pixel centres; add half its perimeter for pixel area
+        hull_area = cv2.contourArea(hull) + 0.5 * cv2.arcLength(hull, True) + 1
+        total += m["area"]
+        if m["area"] / hull_area < CLUMP_SOLIDITY:
+            clumped += m["area"]
+    return 100.0 * clumped / total if total else 0.0
+
+
+def spread_warnings(clumped_pct: float) -> list:
+    """Warnings about how the grounds were spread."""
+    if clumped_pct > CLUMP_WARN_PCT:
+        return [f"{clumped_pct:.0f}% of the coffee is in clumps of touching grains, which read as single "
+                "large grains. Spread thinner so most grains have paper around them."]
+    return []
 
 
 def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np.ndarray:
@@ -481,6 +515,29 @@ def _refine_coin_edge(gray: np.ndarray, cx: float, cy: float, r: float, n_rays: 
     return (ex, ey), (a1, a2), angle, consistency
 
 
+def _edge_support(gray: np.ndarray, center, axes, angle, n_rays: int = 360, min_edge: float = 4.0) -> float:
+    """
+    Fraction of rays with a clear edge (radial gradient >= min_edge grey levels/px)
+    within 1% of a fitted outline. A coin's own edge shows even where grounds are
+    piled against it and hide the paper outside; a circle through grains mostly
+    misses edges.
+    """
+    cx, cy = center
+    a, b = axes[0] / 2, axes[1] / 2
+    phi = np.deg2rad(angle)
+    theta = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+    r = 1 / np.sqrt((np.cos(theta - phi) / a) ** 2 + (np.sin(theta - phi) / b) ** 2)
+    tol = max(1.5, 0.01 * np.sqrt(a * b))
+    rr = r[:, None] + np.arange(-tol, tol + 1e-6, 0.5)[None, :]
+
+    def sample(radius):
+        return ndi.map_coordinates(gray, [cy + np.sin(theta)[:, None] * radius,
+                                          cx + np.cos(theta)[:, None] * radius], order=1, mode="nearest")
+
+    gradient = np.abs(sample(rr + 1) - sample(rr - 1)) / 2
+    return float(np.mean(gradient.max(axis=1) >= min_edge))
+
+
 def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     """Try to auto-detect a circular reference object. Returns (diameter_px, coin_mask)."""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -500,22 +557,35 @@ def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     if circles is None:
         return 0.0, None
 
-    # The coin is the candidate whose edge is consistent all the way round;
-    # circles through grains score ~0.1–0.2, real coins ~0.6–1.0
-    # Quick 60-ray score for every candidate, full fit for the best few
+    # The coin is the candidate with a clean edge all the way round. Two scores:
+    # consistency (paper-side crossings agree; circles through grains ~0.1–0.2,
+    # coins ~0.5–1.0) and edge support (still high when grounds are piled
+    # against the coin; circles through grains up to ~0.75). Quick 60-ray scores
+    # for every candidate, full scores for the best few.
     gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
     coarse = []
     for x, y, r in circles[0]:
         fit = _refine_coin_edge(gray_f, x / f, y / f, r / f, n_rays=60)
         if fit is not None:
-            coarse.append((fit[3], x / f, y / f, r / f))
-    best = None
-    for _, x, y, r in sorted(coarse, reverse=True)[:5]:
+            coarse.append((fit[3] + _edge_support(gray_f, *fit[:3], n_rays=60), x / f, y / f, r / f))
+    accepted = []
+    for _, x, y, r in sorted(coarse, reverse=True)[:8]:
         fit = _refine_coin_edge(gray_f, x, y, r)
-        if fit is not None and fit[3] >= 0.5 and (best is None or fit[3] > best[3]):
-            best = fit
-    if best is None:
+        if fit is None:
+            continue
+        support = _edge_support(gray_f, *fit[:3])
+        if fit[3] >= 0.5 or support >= 0.85:
+            accepted.append((fit[3] + support, fit))
+    if not accepted:
         return 0.0, None
+
+    best = max(accepted, key=lambda s: s[0])[1]
+    # The coin's raised rim can fit a smaller concentric circle; keep the outer edge
+    best_r = np.sqrt(best[1][0] * best[1][1]) / 2
+    for _, fit in accepted:
+        offset = np.hypot(fit[0][0] - best[0][0], fit[0][1] - best[0][1])
+        if offset < 0.1 * best_r and fit[1][0] * fit[1][1] > best[1][0] * best[1][1]:
+            best = fit
 
     center, (a1, a2), angle, _ = best
     coin_mask = np.zeros((h, w), dtype=np.uint8)
@@ -652,6 +722,7 @@ def measure_particles(
         d50_se_mm=stats["d50_se"],
         fines_pct=stats["fines_pct"],
         boulders_pct=stats["boulders_pct"],
+        clumped_pct=clumped_percent(particle_masks),
     )
 
 

@@ -16,6 +16,7 @@ from grind_analyzer import (
     find_reference_circle,
     prepare_image,
     capture_warnings,
+    spread_warnings,
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
@@ -238,13 +239,16 @@ if uploaded is not None:
         if pixel_scale > 0:
             st.success(f"Calibrated: **{pixel_scale:.4f} mm/px** using {ref_choice}")
         else:
-            st.warning("Could not detect a circular reference object. Showing results in pixels.")
+            st.warning("Could not detect a circular reference object. Showing results in pixels. "
+                       "Keep the coin fully in frame with a finger-width of clear paper around it, and avoid glare.")
     for warning in capture_warnings(uploaded.getvalue()):
         st.warning(warning, icon="📷")
 
     unit = "mm" if pixel_scale > 0 else "px"
 
     result = measure_particles(image_bgr, particle_masks, pixel_scale, weighting)
+    for warning in spread_warnings(result.clumped_pct):
+        st.warning(warning, icon="🫘")
     if result.weighting != weighting:
         st.info(f"“{weighting}” needs calibration, so sizes are weighted by {result.weighting}.")
 

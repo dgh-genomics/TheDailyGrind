@@ -32,8 +32,8 @@ pip install -r requirements-sam.txt
 
 ## How to Take a Good Photo
 
-1. **Spread** grounds in a thin, single layer on white paper
-2. **Place** a reference coin (e.g., US Quarter) in the frame
+1. **Spread** grounds in a thin, single layer on white paper, so most grains have paper around them (clumps of touching grains read as one big grain; the app warns when clumps hold over 20% of the coffee). For more grains, take more photos rather than packing one
+2. **Place** a reference coin (e.g., US Quarter) fully in the frame, with a finger-width of clear paper around it
 3. **Photograph** straight down with even, diffuse lighting, using the main (1×) camera
 4. **Avoid** the flash, macro mode (it switches to the ultra-wide lens), shadows, piled-up grounds, and glossy surfaces
 
