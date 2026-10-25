@@ -91,6 +91,11 @@ ULTRAWIDE_MAX_MM = 20
 CLUMP_SOLIDITY = 0.7
 CLUMP_WARN_PCT = 20
 
+# Matched grains read +6% larger in diameter where the paper was 10–30% darker
+# than in direct light, and +11.5% where it was over 30% darker. Warn when part
+# of the paper (5th percentile) is darker than this fraction of the brightest.
+LIGHTING_WARN_RATIO = 0.7
+
 WEIGHTINGS = {
     "available mass": "Mass that water can reach (outer 0.1 mm of each grain), coffeegrindsize's default",
     "mass":           "Grain volume, comparable to sieve or laser-diffraction results",
@@ -198,8 +203,31 @@ def spread_warnings(clumped_pct: float) -> list:
     return []
 
 
+def lighting_evenness(image_bgr: np.ndarray, coin_mask: np.ndarray = None) -> float:
+    """Darkest paper (5th percentile) as a fraction of the brightest (95th): 1 = even light."""
+    paper = _paper_brightness(image_bgr, coin_mask)[::4, ::4]
+    if coin_mask is not None:
+        paper = paper[coin_mask[::4, ::4] == 0]
+    return float(np.percentile(paper, 5) / max(np.percentile(paper, 95), 1e-6))
+
+
+def lighting_warnings(evenness: float) -> list:
+    """Warnings about uneven light (a hand or phone shadow across the paper)."""
+    if evenness < LIGHTING_WARN_RATIO:
+        return [f"Part of the paper is {100 * (1 - evenness):.0f}% darker than the rest (a shadow or uneven light). "
+                "In testing, the same grains read up to ~12% larger in shadow than in direct light. "
+                "Light the whole sheet evenly, with no hand or phone shadow on it."]
+    return []
+
+
 def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np.ndarray:
     """Blue channel divided by a smooth estimate of the local paper brightness (paper ≈ 1)."""
+    paper = _paper_brightness(image_bgr, exclude)
+    return image_bgr[:, :, 0].astype(np.float32) / np.maximum(paper, 1.0)
+
+
+def _paper_brightness(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np.ndarray:
+    """Smooth estimate of the local paper brightness in the blue channel (full resolution)."""
     blue = image_bgr[:, :, 0]
     h, w = blue.shape
 
@@ -219,8 +247,7 @@ def _normalize_to_paper(image_bgr: np.ndarray, exclude: np.ndarray = None) -> np
         paper = cv2.GaussianBlur(small * paper_mask, (0, 0), sigma) / np.maximum(weight, 1e-3)
         paper_mask = (small > 0.8 * paper) & keep
 
-    paper = cv2.resize(paper, (w, h), interpolation=cv2.INTER_LINEAR)
-    return blue.astype(np.float32) / np.maximum(paper, 1.0)
+    return cv2.resize(paper, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def _segment_threshold(image_bgr, coin_mask=None, threshold=DEFAULT_THRESHOLD,
@@ -515,12 +542,13 @@ def _refine_coin_edge(gray: np.ndarray, cx: float, cy: float, r: float, n_rays: 
     return (ex, ey), (a1, a2), angle, consistency
 
 
-def _edge_support(gray: np.ndarray, center, axes, angle, n_rays: int = 360, min_edge: float = 4.0) -> float:
+def _edge_support(gray: np.ndarray, center, axes, angle, n_rays: int = 360, min_edge: float = 0.018) -> float:
     """
-    Fraction of rays with a clear edge (radial gradient >= min_edge grey levels/px)
-    within 1% of a fitted outline. A coin's own edge shows even where grounds are
-    piled against it and hide the paper outside; a circle through grains mostly
-    misses edges.
+    Fraction of rays with a clear edge (radial gradient >= min_edge, in units of
+    local paper brightness per px, i.e. ~4 grey levels on well-lit paper) within
+    1% of a fitted outline. `gray` is normalized to the paper so edges in shadow
+    count the same. A coin's own edge shows even where grounds are piled against
+    it and hide the paper outside; a circle through grains mostly misses edges.
     """
     cx, cy = center
     a, b = axes[0] / 2, axes[1] / 2
@@ -563,17 +591,19 @@ def find_reference_circle(image_bgr: np.ndarray) -> tuple:
     # against the coin; circles through grains up to ~0.75). Quick 60-ray scores
     # for every candidate, full scores for the best few.
     gray_f = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    # Edge strength relative to the local paper, so a coin half in shadow still scores
+    gray_rel = cv2.GaussianBlur(_normalize_to_paper(cv2.merge([gray, gray, gray])), (0, 0), 1.0)
     coarse = []
     for x, y, r in circles[0]:
         fit = _refine_coin_edge(gray_f, x / f, y / f, r / f, n_rays=60)
         if fit is not None:
-            coarse.append((fit[3] + _edge_support(gray_f, *fit[:3], n_rays=60), x / f, y / f, r / f))
+            coarse.append((fit[3] + _edge_support(gray_rel, *fit[:3], n_rays=60), x / f, y / f, r / f))
     accepted = []
     for _, x, y, r in sorted(coarse, reverse=True)[:8]:
         fit = _refine_coin_edge(gray_f, x, y, r)
         if fit is None:
             continue
-        support = _edge_support(gray_f, *fit[:3])
+        support = _edge_support(gray_rel, *fit[:3])
         if fit[3] >= 0.5 or support >= 0.85:
             accepted.append((fit[3] + support, fit))
     if not accepted:

@@ -17,6 +17,8 @@ from grind_analyzer import (
     prepare_image,
     capture_warnings,
     spread_warnings,
+    lighting_evenness,
+    lighting_warnings,
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
@@ -185,7 +187,7 @@ def segment_upload(file_bytes: bytes, use_calibration: bool):
 
     coin_diameter_px, coin_mask = find_reference_circle(image_bgr) if use_calibration else (0.0, None)
     particle_masks = segment_particles(image_bgr, coin_mask)
-    return image_bgr, coin_diameter_px, particle_masks
+    return image_bgr, coin_diameter_px, particle_masks, lighting_evenness(image_bgr, coin_mask)
 
 
 # ── Main UI ──────────────────────────────────────────────────────────────────
@@ -231,7 +233,7 @@ if uploaded is not None:
     if segmented is None:
         st.error("Could not read image. Please try a different file.")
         st.stop()
-    image_bgr, coin_diameter_px, particle_masks = segmented
+    image_bgr, coin_diameter_px, particle_masks, evenness = segmented
 
     # Calibrate
     pixel_scale = ref_diameter_mm / coin_diameter_px if coin_diameter_px > 0 else 0.0
@@ -243,6 +245,8 @@ if uploaded is not None:
                        "Keep the coin fully in frame with a finger-width of clear paper around it, and avoid glare.")
     for warning in capture_warnings(uploaded.getvalue()):
         st.warning(warning, icon="📷")
+    for warning in lighting_warnings(evenness):
+        st.warning(warning, icon="💡")
 
     unit = "mm" if pixel_scale > 0 else "px"
 

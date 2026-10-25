@@ -34,7 +34,7 @@ pip install -r requirements-sam.txt
 
 1. **Spread** grounds in a thin, single layer on white paper, so most grains have paper around them (clumps of touching grains read as one big grain; the app warns when clumps hold over 20% of the coffee). For more grains, take more photos rather than packing one
 2. **Place** a reference coin (e.g., US Quarter) fully in the frame, with a finger-width of clear paper around it
-3. **Photograph** straight down with even, diffuse lighting, using the main (1×) camera
+3. **Photograph** straight down with even lighting over the whole sheet — no hand or phone shadow across it — using the main (1×) camera. Grains in shadow read up to ~12% larger than the same grains in direct light, so the app warns when part of the paper is more than 30% darker than the rest
 4. **Avoid** the flash, macro mode (it switches to the ultra-wide lens), shadows, piled-up grounds, and glossy surfaces
 
 In testing, flash / ultra-wide shots read grains 7–16% smaller than main-camera shots of the same spread; the app and `compare_settings.py` warn when a photo's EXIF data shows either.
