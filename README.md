@@ -72,16 +72,36 @@ Photos sent through messaging apps usually lose their EXIF data, so the camera w
 - **Size weighting** (sidebar): *available mass* (default) counts the coffee water can reach (the outer 0.1 mm of each grain). Other options are *mass*, *surface* and *count*. Count is dominated by fines and depends on camera distance, so avoid it for comparisons.
 - **Fines / Boulders**: share of the coffee in grains under half / over twice the D50.
 - **Clumps**: touching grains that can't be separated (red in the *Detected Particles* tab). They're left out of the sizes. The caption also shows D50 *adjusted to no clumping*; that adjustment is provisional, measured on one bean.
+- **The distribution chart** uses a log size axis, so the fine end is visible. Sizes the camera can't reliably detect at this distance (about 7 pixels across) are shaded grey.
 - **Brew match**: a rough guide only; the size ranges behind it aren't calibrated.
 - **CSV**: one row per measured grain (diameter, area, volume, weight).
 
 Sizes are only comparable when photos are taken the same way (same phone and camera mode, similar spread and light).
 
+## Comparing with a reference grind
+
+D50 is a fair comparison only between distributions of the same *shape*. Two grinders can give the same D50 with very different amounts of fines, and fines are what tip a cup into astringency. So the app also records each grind's shape (its size quantiles relative to its own D50) and checks it before you compare.
+
+Open **🔍 Compare with a saved measurement**, pick a saved reference (for example the grind that tastes right for a coffee), and the app shows:
+
+- the D50 difference and the share of coffee in grains under 0.6 mm, side by side;
+- a **shape check**, which says whether the two distributions can be compared on D50:
+
+| Shape distance | Verdict | Seen in testing |
+|---|---|---|
+| ≤ 0.02 | **Same shape**: comparing D50 is like-for-like | repeat photos and separate spreads of one grind (all ≤ 0.018) |
+| 0.02 – 0.03 | **Somewhat different**: compare D50 together with fines | other settings on the same grinder (median 0.019) |
+| > 0.03 | **Clearly different**: D50 alone isn't fair; compare the full distributions and fines | another grinder, bean or photo setup (median 0.029), or a much coarser or finer grind |
+
+**Shape also changes with size.** As a grinder is set coarser, its fine tail grows relative to its D50. On one grinder, a setting 25% coarser in D50 already scores 0.025. So when the D50s differ by more than 20%, the app says that part of the shape difference comes from the size gap alone. To compare two grinders, pick a reference of similar D50.
+
+For example, against a reference ground on a KM5 grinder at setting 4.2, the same grinder at 3.8 read D50 −4% with the same shape (0.006). A Baratza Encore grind of a different coffee read D50 +54% and a clearly different shape (0.036). Against KM5 setting 5, closer in size, the same Encore grinds had the same shape (0.017–0.020). The cut-offs come from 22 photos and will be refined as more data comes in.
+
 ## Saving your measurements
 
 Below the results, **📝 Save this measurement** adds one line to `measurements.jsonl`, in the folder you started the app from. Set the `TDG_MEASUREMENT_LOG` environment variable to use a different file. Each line records:
 
-- **the measurement:** available-mass D10 / D50 / D90, clump-adjusted D50, fines, share of coffee under 0.6 mm, clumping, lighting evenness and grain count;
+- **the measurement:** available-mass D10 / D50 / D90, clump-adjusted D50, fines, share of coffee under 0.6 mm, the distribution's shape signature, clumping, lighting evenness and grain count;
 - **how the photo was taken:** phone make and model, lens, zoom and flash (from the photo's EXIF), and when it was taken;
 - **what you enter:** bean / roast, grinder and setting, brew method, dose, water, taste, TDS and notes;
 - **for traceability:** the app version, and a fingerprint of the photo so duplicates can be spotted.
@@ -114,7 +134,14 @@ For each weighting it reports:
 
 A final block repeats the analysis with D50 adjusted to no clumping. The adjustment is estimated from your own photos when clumping varies enough.
 
-Output: `photos.csv` (one row per photo, including `clumped_pct`, `lighting_evenness_pct` and `warnings`), per-grain CSVs, and `report.html`.
+It also checks each photo's **distribution shape**:
+
+- **Within a setting:** a photo whose shape differs clearly from the other photos of its setting gets a warning. That usually means a spreading, lighting or camera problem.
+- **Against a calibration grind:** with `--reference SETTING`, every photo and setting is compared with that grind's shape, using the same/somewhat/clearly-different verdicts as the app. For example, `--reference 4.2` makes your known-good grind the yardstick when you add photos from another grinder. Each setting's D50 difference from the reference is listed too; a `*` marks settings more than 20% apart in D50, where part of the shape difference comes from the size gap.
+
+Output: `photos.csv` (one row per photo, including `clumped_pct`, `lighting_evenness_pct`, `span`, `gsd`, `skew`, the shape distances, `d50_vs_reference_pct` and `warnings`), per-grain CSVs, and `report.html`.
+
+`gsd` (geometric SD) depends on how small a grain the camera can see, so compare it only between photos taken from the same distance. The shape distance hardly changes with distance (by 0.005 or less in testing).
 
 Use **separate spreads** (fresh pinches) as replicates. Repeat photos of one spread contain the same grains, so they make settings look more separable than they are.
 
@@ -128,6 +155,7 @@ Measured so far (one bean, one grinder, one phone: Motorola edge 2024, 2× main 
   - After clump handling, a straight line fits with R² 0.97.
   - One spread predicts the setting to within about ±0.2 of a step (±0.16 to ±0.25, depending on whether the provisional clump adjustment is counted).
 - **Taste:** for this bean, a 0.4-step change crossed into over-extraction. One photo can't resolve that reliably yet; several spreads per measurement can.
+- **A second grinder (first look):** a Baratza Encore at settings 15 and 19 (a different coffee) read D50 1.6–1.7 mm. That matches the KM5 at about 6.6–6.8, extrapolated from the setting 3–5 line. Compared with KM5 5, the closest in size, the Encore had the same shape. So far, the two grinders differ mainly in coarseness, not in distribution shape.
 
 **Not yet known or not yet handled:**
 

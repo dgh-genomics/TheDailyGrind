@@ -26,7 +26,10 @@ how D50 moves with clumping within settings in this experiment (or the
 provisional default when clumping barely varies).
 
 Each photo is checked for flash / ultra-wide lens (EXIF), clumping and uneven
-light; warnings are printed and listed in the report.
+light; warnings are printed and listed in the report. Each photo's distribution
+shape (span, geometric SD, skew; grind_analyzer.shape_signature) is also checked
+against the other photos of its setting, and with --reference SETTING against a
+calibration grind, so comparisons between unlike distributions are flagged.
 
 Writes to --out: photos.csv (one row per photo, incl. clumped_pct,
 lighting_evenness_pct and warnings), particles/<setting>/... .csv (one row per
@@ -113,6 +116,72 @@ def pooled_sd(groups: list) -> float:
     if dof == 0:
         return float("nan")
     return math.sqrt(sum((len(g) - 1) * np.var(g, ddof=1) for g in groups if len(g) > 1) / dof)
+
+
+def add_shape_checks(rows: list, particles: dict, reference: str = None) -> str:
+    """
+    Shape signature per photo (available mass) added to rows, plus two checks:
+    - photos whose shape differs clearly from the other photos of their setting
+      (often a spreading, lighting or camera problem) get a warning;
+    - with `reference`, each photo is compared with that setting's pooled shape.
+    Returns a text summary for the report.
+    """
+    def signature(dav_list):
+        """(shape signature, available-mass D50 in mm) of the pooled grains."""
+        d = np.concatenate([x[0] for x in dav_list])
+        a = np.concatenate([x[1] for x in dav_list])
+        v = np.concatenate([x[2] for x in dav_list])
+        w, _ = ga.particle_weights(a, v, "available mass", pixel_scale=1.0)  # sizes are already in mm
+        return ga.shape_signature(d, w), (ga.weighted_percentile(d, w, 50) if len(d) else float("nan"))
+
+    settings = list(dict.fromkeys(r["setting"] for r in rows))
+    ref_sig = ref_d50 = None
+    if reference is not None:
+        if reference not in particles:
+            raise SystemExit(f"--reference {reference!r} is not one of the settings: {', '.join(settings)}")
+        ref_sig, ref_d50 = signature(particles[reference])
+
+    lines, outliers, size_gap = [], [], False
+    for setting in settings:
+        photos = [r for r in rows if r["setting"] == setting]
+        for i, row in enumerate(photos):
+            sig, d50 = signature([particles[setting][i]])
+            row.update(span=sig.get("span"), gsd=sig.get("gsd"), skew=sig.get("skew"))
+            if len(photos) > 1:
+                others, _ = signature([p for j, p in enumerate(particles[setting]) if j != i])
+                dist = ga.shape_distance(sig, others)
+                row["shape_dist_within_setting"] = round(dist, 4)
+                if dist > ga.SHAPE_DIFFERENT_MIN:
+                    msg = (f"distribution shape differs clearly from the other photos of setting {setting} "
+                           f"(distance {dist:.3f}); check spreading, lighting and camera")
+                    row["warnings"] = " | ".join(filter(None, [row["warnings"], msg]))
+                    outliers.append(f"{row['photo']} ({dist:.3f})")
+                    print(f"  ! {row['photo']}: {msg}")
+            if ref_sig:
+                dist, level, _ = ga.shape_comparison(sig, ref_sig)
+                row["shape_dist_to_reference"] = round(dist, 4)
+                row["shape_vs_reference"] = level
+                row["d50_vs_reference_pct"] = round(100 * (d50 / ref_d50 - 1), 1)
+        if ref_sig:
+            pooled_sig, pooled_d50 = signature(particles[setting])
+            dist, level, _ = ga.shape_comparison(pooled_sig, ref_sig)
+            # Coarser or finer grinds shift shape on their own (see ga.SHAPE_SIZE_GAP)
+            gap = level != "same" and abs(pooled_d50 / ref_d50 - 1) > ga.SHAPE_SIZE_GAP
+            size_gap |= gap
+            lines.append(f"  setting {setting:>6}: distance {dist:.3f} ({level}), "
+                         f"D50 {100 * (pooled_d50 / ref_d50 - 1):+.0f}%{' *' if gap else ''}")
+
+    text = (f"Distribution shape: shape distance <= {ga.SHAPE_SAME_MAX} is within repeat-photo noise, "
+            f"> {ga.SHAPE_DIFFERENT_MIN} is clearly different (see span, gsd, skew in photos.csv).")
+    text += ("\n  photos whose shape differs clearly from the rest of their setting: " + ", ".join(outliers)
+             if outliers else "\n  no photo's shape differs clearly from the rest of its setting.")
+    if ref_sig:
+        text += f"\nShape of each setting compared with the reference (setting {reference}):\n" + "\n".join(lines)
+        if size_gap:
+            text += (f"\n  * D50 differs from the reference by more than {100 * ga.SHAPE_SIZE_GAP:.0f}%. A grind's fine "
+                     "tail grows relative to its D50 as it gets coarser, so part of that shape difference comes from "
+                     "the size gap alone. To compare grinders, use a reference of similar D50.")
+    return text
 
 
 def clump_coefficient(rows: list, key: str) -> tuple:
@@ -276,6 +345,8 @@ def main():
     ap.add_argument("--threshold", type=float, default=ga.DEFAULT_THRESHOLD,
                     help="coffee if blue < this fraction of the paper (default %(default)s)")
     ap.add_argument("--sam", action="store_true", help="refine larger grains with MobileSAM")
+    ap.add_argument("--reference", help="setting to treat as the calibration grind: every photo's distribution "
+                                        "shape is compared with it")
     args = ap.parse_args()
     args.coin_mm = args.coin_mm or ga.REFERENCE_OBJECTS[args.coin]
     unit = "mm"
@@ -320,10 +391,12 @@ def main():
 
     if len(set(r["setting"] for r in rows)) < 2:
         raise SystemExit("Need usable photos from at least two settings to compare.")
+    shape_text = add_shape_checks(rows, particles, args.reference)
 
     args.out.mkdir(parents=True, exist_ok=True)
     with open(args.out / "photos.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        # Some columns exist only for some rows (e.g. shape checks need 2+ photos per setting)
+        writer = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -341,6 +414,7 @@ def main():
     text = (f"Clump adjustment: D50 changes {100 * coef:+.2f}% per point of clumping ({source}); "
             "the last block shows available-mass D50 adjusted to no clumping.\n\n")
     text += "\n\n".join(format_summary(s, unit) for s in summaries)
+    text += "\n\n" + shape_text
     seps = {s["weighting"]: np.nanmedian([p["separation"] for p in s["pairs"]]) for s in summaries}
     best = max(seps, key=lambda k: -1 if math.isnan(seps[k]) else seps[k])
     verdict = (f"Best weighting: {best} (median neighbour separation {seps[best]:.1f}× the photo-to-photo SD; "

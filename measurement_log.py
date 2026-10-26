@@ -23,7 +23,8 @@ from PIL import ExifTags, Image
 
 import grind_analyzer as ga
 
-SCHEMA_VERSION = 1
+# 1: first version. 2: adds "shape" (grind_analyzer.shape_signature) for shape comparisons.
+SCHEMA_VERSION = 2
 
 BREW_METHODS = ["Drip machine", "Pour-over", "French press / immersion", "AeroPress", "Espresso",
                 "Cold brew", "Other"]
@@ -111,9 +112,35 @@ def build_record(photo_bytes: bytes, result: "ga.AnalysisResult", *, coin_diamet
             "boulders_pct": _round(result.boulders_pct, 2),
             "share_under_0_6mm_pct": _round(share_under_06, 2),
         },
+        "shape": result.shape or {},
         "warnings": list(warnings),
         "context": context,
     }
+
+
+def read_records(path: Path = None) -> list:
+    """All records in the log (skipping unreadable lines); [] if there is no log yet."""
+    path = Path(path or log_path())
+    if not path.exists():
+        return []
+    records = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def describe(record: dict) -> str:
+    """One-line label for picking a record, e.g. as a comparison reference."""
+    c = record.get("context", {})
+    parts = [c.get("bean"), c.get("grinder"), f"setting {c['setting']}" if c.get("setting") else None,
+             c.get("brew_method"), f"taste: {c['taste']}" if c.get("taste") not in (None, "Not tasted") else None]
+    size = record.get("size", {})
+    d50 = f"D50 {size['d50']:.2f} {size.get('unit', 'mm')}" if size.get("d50") else None
+    return " · ".join(p for p in [record.get("saved_at", "")[:16].replace("T", " "), *parts, d50] if p)
 
 
 def append_record(record: dict, path: Path = None) -> int:
