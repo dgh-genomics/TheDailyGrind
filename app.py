@@ -319,16 +319,16 @@ if uploaded is not None:
 
     with tab_hist:
         fig = make_histogram(result, unit)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with tab_img:
         # Convert BGR → RGB for display
         labeled_rgb = cv2.cvtColor(preview(result.labeled_image), cv2.COLOR_BGR2RGB)
-        st.image(labeled_rgb, caption=f"{result.num_particles} particles detected", use_container_width=True)
+        st.image(labeled_rgb, caption=f"{result.num_particles} particles detected", width="stretch")
 
     with tab_thresh:
         st.image(preview(result.threshold_image), caption="Binary threshold mask (white = coffee)",
-                 use_container_width=True)
+                 width="stretch")
 
     # Download CSV
     st.markdown("---")
