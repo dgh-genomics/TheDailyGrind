@@ -57,6 +57,7 @@ class AnalysisResult:
     fines_pct: float
     boulders_pct: float
     clumped_pct: float         # share of grain area in clumps of touching grains
+    shape: dict = None         # shape_signature() of the measured distribution
 
 
 REFERENCE_OBJECTS = {
@@ -78,6 +79,10 @@ BOULDERS_RATIO = 2.0  # boulders: larger than twice D50
 
 # Larger photos are downscaled. Resolution limits accuracy, so keep this high.
 MAX_IMAGE_DIM = 4000
+
+# Grains smaller than this many pixels across are under-detected: across repeat
+# photos of one spread, only ~43% of grains under ~0.3 mm (~7 px) were found again.
+UNDER_DETECTED_PX = 7
 
 # A pixel is coffee if its blue value is below this fraction of the paper's
 DEFAULT_THRESHOLD = 0.588
@@ -102,6 +107,21 @@ CLUMP_WARN_PCT = 20
 # grains still rose ~0.44% per point of clumping across 8 spreads of one bean
 # (settings 3–5); clump_adjusted() removes that. Provisional: one bean, one phone.
 CLUMP_ADJUST_PER_PCT = 0.0044
+
+# Shape signature: available-mass quantiles relative to D50, so grinds can be
+# compared on shape alone. Shape-distance cut-offs from 22 photos: repeat photos
+# and separate spreads of one grind all <= 0.018; other settings on one grinder
+# median 0.019 (5% above 0.03); other grinders, beans or photo sets median 0.029.
+SHAPE_QUANTILES = np.linspace(0.05, 0.95, 19)
+SHAPE_SAME_MAX = 0.02
+SHAPE_DIFFERENT_MIN = 0.03
+
+# Shape also shifts with size: the fine tail grows relative to D50 as a grinder
+# is set coarser. On one KM5, D50 +25% (setting 4.2 -> 5) gave shape distance
+# 0.025, and an Encore grind ~55% coarser than KM5 4.2 matched KM5 5's shape
+# (0.017-0.020) but not 4.2's (0.024-0.036). shape_comparison() says so when the
+# two D50s differ by more than this fraction.
+SHAPE_SIZE_GAP = 0.2
 
 # Matched grains read +6% larger in diameter where the paper was 10–30% darker
 # than in direct light, and +11.5% where it was over 30% darker. Warn when part
@@ -750,6 +770,66 @@ def weighted_percentile(values, weights, q):
     return np.interp(np.asarray(q) / 100.0, cdf, v)
 
 
+def shape_signature(diameters, weights, weighting: str = "available mass") -> dict:
+    """
+    The shape of a size distribution, independent of its size: log10(d / D50) at
+    SHAPE_QUANTILES of the weights, plus span ((D90 - D10) / D50), geometric SD
+    and skew of log size. Two signatures give a shape distance without keeping
+    the grains. Empty if there are too few grains.
+    """
+    diameters, weights = np.asarray(diameters), np.asarray(weights)
+    if len(diameters) < 20 or weights.sum() <= 0:
+        return {}
+    d10, d50, d90 = weighted_percentile(diameters, weights, [10, 50, 90])
+    q = weighted_percentile(diameters, weights, SHAPE_QUANTILES * 100)
+    x = np.log10(diameters)
+    mean = np.average(x, weights=weights)
+    sd = np.sqrt(np.average((x - mean) ** 2, weights=weights))
+    return {
+        "weighting": weighting,
+        "quantiles_log10_rel": [round(float(v), 4) for v in np.log10(q / d50)],
+        "span": round(float((d90 - d10) / d50), 3),
+        "gsd": round(float(10 ** sd), 3),
+        "skew": round(float(np.average((x - mean) ** 3, weights=weights) / sd ** 3), 3) if sd > 0 else 0.0,
+    }
+
+
+def shape_distance(sig_a: dict, sig_b: dict) -> float:
+    """Mean absolute gap between two shape signatures' quantiles, in log10 units (≈ Wasserstein-1)."""
+    qa, qb = np.array(sig_a["quantiles_log10_rel"]), np.array(sig_b["quantiles_log10_rel"])
+    return float(np.mean(np.abs(qa - qb)))
+
+
+def shape_comparison(sig: dict, reference: dict, d50_ratio: float = None) -> tuple:
+    """
+    Compare a distribution's shape with a reference (e.g. a calibration grind).
+    Returns (distance, level, message); level is "same", "somewhat different"
+    or "clearly different". None if either signature is missing. With d50_ratio
+    (this D50 / the reference's, same units), the message notes when part of a
+    shape difference is expected from the size gap alone (SHAPE_SIZE_GAP).
+    """
+    if not sig or not reference:
+        return None
+    dist = shape_distance(sig, reference)
+    if dist <= SHAPE_SAME_MAX:
+        level, msg = "same", ("Same shape as the reference, within repeat-photo noise: "
+                              "comparing D50 is like-for-like.")
+    elif dist <= SHAPE_DIFFERENT_MIN:
+        level, msg = "somewhat different", ("Somewhat different shape, as seen between settings on one grinder: "
+                                            "compare D50 together with the fines share.")
+    else:
+        level, msg = "clearly different", ("Clearly different shape, as seen with another grinder, bean or photo "
+                                           "setup: D50 alone isn't a fair comparison; compare the full "
+                                           "distributions and the fines.")
+    if level != "same" and d50_ratio and abs(d50_ratio - 1) > SHAPE_SIZE_GAP:
+        msg += (f" The D50s also differ by {100 * abs(d50_ratio - 1):.0f}%, and a grind's fine tail grows relative "
+                "to its D50 as it gets coarser, so part of this shape difference comes from the size gap alone. "
+                "To compare grinders, use a reference of similar D50.")
+    if sig.get("weighting") != reference.get("weighting"):
+        msg += " (Note: the two use different size weightings.)"
+    return dist, level, msg
+
+
 def size_stats(diameters, weights, n_boot: int = 200, seed: int = 0) -> dict:
     """Weighted D10/D50/D90, mean, std, fines/boulders % of weight, and D50 standard error."""
     if len(diameters) == 0:
@@ -817,6 +897,7 @@ def measure_particles(
         fines_pct=stats["fines_pct"],
         boulders_pct=stats["boulders_pct"],
         clumped_pct=clumped_percent(particle_masks, clumps),
+        shape=shape_signature(diameters, weights, weighting),
     )
 
 

@@ -23,10 +23,12 @@ from grind_analyzer import (
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
+    UNDER_DETECTED_PX,
     WEIGHTINGS,
     AnalysisResult,
 )
-from measurement_log import BREW_METHODS, TASTES, append_record, build_record, log_path
+from grind_analyzer import shape_comparison
+from measurement_log import BREW_METHODS, TASTES, append_record, build_record, camera_info, describe, log_path, read_records
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -101,23 +103,36 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
         subplot_titles=("Particle Size Distribution", "Cumulative Distribution"),
     )
 
-    # Histogram, as % of total weight. Error bars are counting (Poisson) noise:
-    # a bin built from n grains is uncertain by 1/√n of its height.
-    nbins = min(80, max(20, int(np.sqrt(len(d)) * 2)))
-    edges = np.histogram_bin_edges(d, bins=nbins)
+    # Histogram on a log size axis (bins of equal width in log size, so the fine
+    # end isn't squashed), as % of total weight. Error bars are counting
+    # (Poisson) noise: a bin built from n grains is uncertain by 1/√n of its height.
+    # On a log axis, plotly takes shapes (lines, bands) in data units but
+    # annotations in log10 units.
+    lg = np.log10
+    nbins = min(60, max(20, int(np.sqrt(len(d)) * 1.5)))
+    edges = np.logspace(lg(d.min()), lg(d.max() * 1.0001), nbins + 1)
     counts, _ = np.histogram(d, edges)
     pct = np.histogram(d, edges, weights=w)[0] / np.sum(w) * 100
     err = np.where(counts > 0, pct / np.sqrt(np.maximum(counts, 1)), 0)
     fig.add_trace(
         go.Bar(
-            x=(edges[:-1] + edges[1:]) / 2, y=pct, width=np.diff(edges),
+            x=edges[:-1], y=pct, width=np.diff(edges), offset=0,
             error_y=dict(type="data", array=err, color="#8b6914", thickness=1, width=0),
             marker_color="#c9a96e", marker_line_color="#8b6914",
             marker_line_width=0.5, opacity=0.85,
-            customdata=counts, hovertemplate="%{x:.2f}: %{y:.1f}% (%{customdata} grains)<extra></extra>",
+            customdata=np.column_stack([np.sqrt(edges[:-1] * edges[1:]), counts]),
+            hovertemplate="%{customdata[0]:.2f}: %{y:.1f}% (%{customdata[1]} grains)<extra></extra>",
         ),
         row=1, col=1,
     )
+
+    # Grains under ~7 px across are too small to detect reliably
+    limit = UNDER_DETECTED_PX * (result.pixel_scale if result.pixel_scale > 0 else 1.0)
+    if limit > edges[0]:
+        fig.add_vrect(x0=edges[0], x1=limit, fillcolor="#888", opacity=0.12, line_width=0, row=1, col=1)
+        fig.add_annotation(x=lg(edges[0]), y=0.98, yref="paper", xanchor="left", yanchor="top",
+                           text=f"under-detected<br>(< {limit:.2f} {unit_label})", showarrow=False,
+                           font=dict(color="#999", size=10))
 
     # Vertical lines for D10 / D50 / D90
     for val, label, color in [
@@ -127,14 +142,14 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
     ]:
         fig.add_vline(x=val, line_dash="dash", line_color=color, line_width=1.5, row=1, col=1)
         fig.add_annotation(
-            x=val, y=1, yref="paper", text=f"{label}: {val:.2f}",
+            x=lg(val), y=1, yref="paper", text=f"{label}: {val:.2f}",
             showarrow=False, font=dict(color=color, size=11), yshift=10,
         )
 
     # Brew-method shading
     for method, (lo, hi) in BREW_GUIDES.items():
         fig.add_vrect(
-            x0=lo, x1=hi, fillcolor="#c9a96e", opacity=0.04,
+            x0=max(lo, edges[0]), x1=hi, fillcolor="#c9a96e", opacity=0.04,
             line_width=0, row=1, col=1,
         )
 
@@ -160,7 +175,9 @@ def make_histogram(result: AnalysisResult, unit_label: str) -> go.Figure:
         showlegend=False,
         margin=dict(t=40, b=40),
     )
-    fig.update_xaxes(title_text=f"Particle Diameter ({unit_label})", row=2, col=1)
+    ticks = [t for t in (0.1, 0.2, 0.3, 0.5, 1, 2, 3, 5) if edges[0] <= t <= edges[-1]] if unit_label == "mm" else None
+    fig.update_xaxes(type="log", tickvals=ticks, row=1, col=1)
+    fig.update_xaxes(type="log", tickvals=ticks, title_text=f"Particle Diameter ({unit_label}, log scale)", row=2, col=1)
     fig.update_yaxes(title_text=f"% of {result.weighting}", row=1, col=1)
     fig.update_yaxes(title_text="Cumulative %", row=2, col=1)
 
@@ -302,16 +319,16 @@ if uploaded is not None:
 
     with tab_hist:
         fig = make_histogram(result, unit)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with tab_img:
         # Convert BGR → RGB for display
         labeled_rgb = cv2.cvtColor(preview(result.labeled_image), cv2.COLOR_BGR2RGB)
-        st.image(labeled_rgb, caption=f"{result.num_particles} particles detected", use_container_width=True)
+        st.image(labeled_rgb, caption=f"{result.num_particles} particles detected", width="stretch")
 
     with tab_thresh:
         st.image(preview(result.threshold_image), caption="Binary threshold mask (white = coffee)",
-                 use_container_width=True)
+                 width="stretch")
 
     # Download CSV
     st.markdown("---")
@@ -327,6 +344,41 @@ if uploaded is not None:
         file_name="grind_analysis.csv",
         mime="text/csv",
     )
+
+    # Comparisons and the log always use available-mass sizes, so records stay comparable
+    am_result = result if result.weighting == "available mass" else \
+        measure_particles(image_bgr, particle_masks, pixel_scale, "available mass")
+
+    def share_under(r, mm=0.6):
+        d, w = r.diameters_mm, r.weights
+        return 100 * w[d < mm].sum() / w.sum() if pixel_scale > 0 and len(d) and w.sum() > 0 else None
+
+    # Compare with a saved measurement, e.g. a calibration grind
+    references = [r for r in read_records() if r.get("shape")]
+    with st.expander("🔍 Compare with a saved measurement"):
+        if not references:
+            st.caption("Save a measurement first (below); it can then be used as a reference, "
+                       "e.g. the grind that tastes right for a coffee.")
+        else:
+            ref = st.selectbox("Reference", references[::-1], format_func=describe, key="compare_ref")
+            ref_size, ref_unit = ref.get("size", {}), ref.get("size", {}).get("unit", "mm")
+            d50_ratio = am_result.d50_mm / ref_size["d50"] if unit == ref_unit and ref_size.get("d50") else None
+            check = shape_comparison(am_result.shape, ref["shape"], d50_ratio)
+            here_under, ref_under = share_under(am_result), ref_size.get("share_under_0_6mm_pct")
+            rows = [("D50 (available mass)", f"{am_result.d50_mm:.2f} {unit}", f"{ref_size.get('d50', float('nan')):.2f} {ref_unit}"),
+                    ("Coffee in grains < 0.6 mm", f"{here_under:.1f}%" if here_under is not None else "–",
+                     f"{ref_under:.1f}%" if ref_under is not None else "–"),
+                    ("Clumped", f"{am_result.clumped_pct:.0f}%", f"{ref.get('capture', {}).get('clumped_pct', float('nan')):.0f}%")]
+            st.table({"": [r[0] for r in rows], "This photo": [r[1] for r in rows], "Reference": [r[2] for r in rows]})
+            if d50_ratio:
+                st.markdown(f"**D50 is {100 * (d50_ratio - 1):+.1f}%** compared with the reference.")
+            if check:
+                dist, level, msg = check
+                {"same": st.success, "somewhat different": st.info, "clearly different": st.warning}[level](
+                    f"Shape distance {dist:.3f}. {msg}")
+            here_cam, ref_cam = camera_info(uploaded.getvalue()).get("model"), ref.get("camera", {}).get("model")
+            if here_cam and ref_cam and here_cam != ref_cam:
+                st.caption(f"Different phones ({here_cam} vs {ref_cam}): sizes may be offset between them.")
 
     # Save to the local measurement log (see measurement_log.py)
     with st.expander("📝 Save this measurement"):
@@ -346,8 +398,7 @@ if uploaded is not None:
                                   format="%.2f", key="log_tds")
             notes = st.text_input("Notes", key="log_notes")
             if st.form_submit_button("Save"):
-                logged = result if result.weighting == "available mass" else \
-                    measure_particles(image_bgr, particle_masks, pixel_scale, "available mass")
+                logged = am_result
                 context = {
                     "bean": bean or None, "grinder": grinder or None, "setting": setting or None,
                     "brew_method": method, "dose_g": dose or None, "water_g": water or None,
