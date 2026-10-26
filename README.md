@@ -155,7 +155,7 @@ Measured so far (one bean, one grinder, one phone: Motorola edge 2024, 2× main 
   - After clump handling, a straight line fits with R² 0.97.
   - One spread predicts the setting to within about ±0.2 of a step (±0.16 to ±0.25, depending on whether the provisional clump adjustment is counted).
 - **Taste:** for this bean, a 0.4-step change crossed into over-extraction. One photo can't resolve that reliably yet; several spreads per measurement can.
-- **A second grinder (first look):** a Baratza Encore at settings 15 and 19 (a different coffee) read D50 1.6–1.7 mm. That matches the KM5 at about 6.6–6.8, extrapolated from the setting 3–5 line. Compared with KM5 5, the closest in size, the Encore had the same shape. So far, the two grinders differ mainly in coarseness, not in distribution shape.
+- **A second grinder (first look):** a Baratza Encore at settings 15 and 19 (a different coffee) read D50 1.6–1.7 mm. That matches the KM5 at about 6.5–6.8, extrapolated from the setting 3–5 line. Compared with KM5 5, the closest in size, the Encore had the same shape. So far, the two grinders differ mainly in coarseness, not in distribution shape.
 
 **Not yet known or not yet handled:**
 
