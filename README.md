@@ -2,7 +2,7 @@
 
 Measure your coffee grind from a phone photo. Spread a pinch of grounds on white paper next to a coin, take a photo, and get the grind size distribution (D10 / D50 / D90, fines, boulders) in seconds.
 
-> **Status: early prototype.** Validated so far on one bean, one grinder and one phone (see [How well does it work?](#how-well-does-it-work)). Feedback is very welcome, especially [saved measurements](#saving-your-measurements) from other phones, grinders and brewers.
+> **Status: early prototype.** Validated so far on one bean and one phone, mostly on one grinder (see [How well does it work?](#how-well-does-it-work)). Feedback is very welcome, especially [saved measurements](#saving-your-measurements) from other phones, grinders and brewers.
 
 ## Try it (about 5 minutes)
 
@@ -95,7 +95,7 @@ Open **🔍 Compare with a saved measurement**, pick a saved reference (for exam
 
 **Shape also changes with size.** As a grinder is set coarser, its fine tail grows relative to its D50. On one grinder, a setting 25% coarser in D50 already scores 0.025. So when the D50s differ by more than 20%, the app says that part of the shape difference comes from the size gap alone. To compare two grinders, pick a reference of similar D50.
 
-For example, against a reference ground on a KM5 grinder at setting 4.2, the same grinder at 3.8 read D50 −4% with the same shape (0.006). A Baratza Encore grind of a different coffee read D50 +54% and a clearly different shape (0.036). Against KM5 setting 5, closer in size, the same Encore grinds had the same shape (0.017–0.020). The cut-offs come from 22 photos and will be refined as more data comes in.
+For example, against a reference ground on a KM5 grinder at setting 4.2, the same grinder at 3.8 read D50 −4% with the same shape (0.006). A Baratza Encore at setting 8, with the same bean, read almost the same D50 (−2%) but a clearly different shape (0.044), because it had more coffee in fine grains. On D50 alone, the two grinds would have looked interchangeable. The cut-offs come from 22 photos and will be refined as more data comes in.
 
 ## Saving your measurements
 
@@ -147,7 +147,7 @@ Use **separate spreads** (fresh pinches) as replicates. Repeat photos of one spr
 
 ## How well does it work?
 
-Measured so far (one bean, one grinder, one phone: Motorola edge 2024, 2× main camera):
+Measured so far (one bean and one phone: Motorola edge 2024, 2× main camera; a KM5 grinder unless noted):
 
 - **Synthetic photos with known sizes:** D50 within 1–2% of the truth, at any spread density.
 - **Same spread, photographed again:** D50 agrees within about 3% in even light. Lit grains match to 3–5% each.
@@ -155,10 +155,15 @@ Measured so far (one bean, one grinder, one phone: Motorola edge 2024, 2× main 
   - After clump handling, a straight line fits with R² 0.97.
   - One spread predicts the setting to within about ±0.2 of a step (±0.16 to ±0.25, depending on whether the provisional clump adjustment is counted).
 - **Taste:** for this bean, a 0.4-step change crossed into over-extraction. One photo can't resolve that reliably yet; several spreads per measurement can.
-- **A second grinder (first look):** a Baratza Encore at settings 15 and 19 (a different coffee) read D50 1.6–1.7 mm. That matches the KM5 at about 6.5–6.8, extrapolated from the setting 3–5 line. Compared with KM5 5, the closest in size, the Encore had the same shape. So far, the two grinders differ mainly in coarseness, not in distribution shape.
+- **A second grinder (Baratza Encore):**
+  - **Encore 8** (same bean) matched KM5 3.8–4.2 in D50, the two settings either side of this bean's astringency boundary. But it carried more fines: about 13% of the coffee in grains under 0.6 mm, against 8–9% for the KM5. Neither clumping nor camera distance explains the gap; all photos here are counted from 0.4 mm up, because the Encore photos were taken closer.
+  - **Encore 10** (same bean) matched KM5 ≈ 4.9 in D50, with about the same fines as the KM5 at that size.
+  - **Encore ~17** (a different coffee, from an earlier session) matched KM5 ≈ 6.5, with the same shape as KM5 5. Those photos were labelled 15 and 19, but the grinds were probably mixed up, so they're treated as one setting.
+  - So two grinders can't be matched on D50 alone. Toward the fine end, where astringency starts, the Encore makes more fines at the same D50.
 
 **Not yet known or not yet handled:**
 
+- **What sets astringency, D50 or fines:** on the KM5 they moved together. Encore 9 should tell them apart: by D50 it should taste fine, by fines it should be astringent.
 - **Other phones:** they may differ by more than the effects above.
 - **Absolute accuracy:** never checked against a sieve or laser diffraction.
 - **Coin fit:** some fits land on the coin's raised inner rim, reading 1–4% small.
