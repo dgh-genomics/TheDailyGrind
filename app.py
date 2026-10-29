@@ -20,6 +20,8 @@ from grind_analyzer import (
     clump_adjusted,
     lighting_evenness,
     lighting_warnings,
+    edge_width,
+    focus_warnings,
     REFERENCE_OBJECTS,
     FINES_RATIO,
     BOULDERS_RATIO,
@@ -194,7 +196,7 @@ def preview(image: np.ndarray, max_width: int = 1600) -> np.ndarray:
 
 @st.cache_data(max_entries=4, show_spinner="Detecting particles…")
 def segment_upload(file_bytes: bytes, use_calibration: bool):
-    """Decode an upload, find the coin and segment particles.
+    """Decode an upload, find the coin and segment particles; also measure lighting and grain-edge width (px).
 
     Cached on the file bytes, so reruns (any click, changing the reference coin
     or weighting) skip segmentation. Returns None if the image can't be decoded.
@@ -206,7 +208,8 @@ def segment_upload(file_bytes: bytes, use_calibration: bool):
 
     coin_diameter_px, coin_mask = find_reference_circle(image_bgr) if use_calibration else (0.0, None)
     particle_masks = segment_particles(image_bgr, coin_mask)
-    return image_bgr, coin_diameter_px, particle_masks, lighting_evenness(image_bgr, coin_mask)
+    return (image_bgr, coin_diameter_px, particle_masks, lighting_evenness(image_bgr, coin_mask),
+            edge_width(image_bgr, particle_masks, coin_mask))
 
 
 # ── Main UI ──────────────────────────────────────────────────────────────────
@@ -252,7 +255,7 @@ if uploaded is not None:
     if segmented is None:
         st.error("Could not read image. Please try a different file.")
         st.stop()
-    image_bgr, coin_diameter_px, particle_masks, evenness = segmented
+    image_bgr, coin_diameter_px, particle_masks, evenness, edge_px = segmented
 
     # Calibrate
     pixel_scale = ref_diameter_mm / coin_diameter_px if coin_diameter_px > 0 else 0.0
@@ -264,6 +267,8 @@ if uploaded is not None:
                        "Keep the coin fully in frame with a finger-width of clear paper around it, and avoid glare.")
     for warning in capture_warnings(uploaded.getvalue()):
         st.warning(warning, icon="📷")
+    for warning in focus_warnings(edge_px, pixel_scale):
+        st.warning(warning, icon="👓")
     for warning in lighting_warnings(evenness):
         st.warning(warning, icon="💡")
 
@@ -405,10 +410,11 @@ if uploaded is not None:
                     "taste": taste, "tds_pct": tds or None, "notes": notes or None,
                     "reference_object": ref_choice if pixel_scale > 0 else None,
                 }
-                warnings_all = (capture_warnings(uploaded.getvalue()) + lighting_warnings(evenness)
-                                + spread_warnings(logged.clumped_pct))
+                warnings_all = (capture_warnings(uploaded.getvalue()) + focus_warnings(edge_px, pixel_scale)
+                                + lighting_warnings(evenness) + spread_warnings(logged.clumped_pct))
                 record = build_record(uploaded.getvalue(), logged, coin_diameter_px=coin_diameter_px,
-                                      evenness=evenness, warnings=warnings_all, context=context)
+                                      evenness=evenness, edge_width_px=edge_px, warnings=warnings_all,
+                                      context=context)
                 st.success(f"Saved. `{log_path()}` now holds {append_record(record)} measurement(s).")
 
 else:

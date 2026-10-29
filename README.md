@@ -36,7 +36,8 @@ How you spread and light the grounds matters more than anything else. In testing
 3. **A coin** (US quarter by default; pick yours in the sidebar), fully in the frame, with a finger-width of clear paper around it.
 4. **Even light over the whole sheet.** No hand or phone shadow across the paper.
 5. **Main camera at 1× or 2×**, straight down. **No flash, no macro mode** (macro switches to the ultra-wide lens).
-6. **JPEG at full resolution.** iPhone HEIC photos must be converted for the comparison script.
+6. **In focus.** Tap the screen on the grounds before you shoot, then zoom in on the photo: the grains should have crisp edges.
+7. **JPEG at full resolution.** iPhone HEIC photos must be converted for the comparison script.
 
 ### How thin to spread
 
@@ -55,6 +56,10 @@ Each panel is the same 24 × 16 mm patch of paper (top: photo, bottom: what the 
 
 The same grain measures about 6% larger where the paper is 10–30% darker, for example in your hand's shadow, than in direct light. The app warns when part of the paper is more than 30% darker than the rest. Light the whole sheet the same way: all in soft window light, or all under one lamp.
 
+### Focus
+
+A blurry photo makes a grind look coarser than it is, so it can make a too-fine grind look fine. Blur merges neighbouring grains and hides the smallest ones. In testing, out-of-focus photos found 25–56% fewer grains and read D50 3–23% larger than in-focus photos of the same grounds, with fewer fines. The app warns when grain edges are blurred over more than 0.36 mm (in-focus photos measured 0.12–0.33 mm). Up close, a phone doesn't always focus on the grounds: tap on them before you shoot, and check the photo.
+
 ### What the warnings mean
 
 | Warning | Cause | Fix |
@@ -62,6 +67,7 @@ The same grain measures about 6% larger where the paper is 10–30% darker, for 
 | 📷 The flash fired / ultra-wide lens | Flash or macro mode (from the photo's EXIF data) | Main camera, flash off. These shots read 7–16% smaller |
 | 🫘 X% of the coffee is in clumps | Grounds spread too densely | Spread thinner |
 | 💡 Part of the paper is X% darker | A shadow or uneven light | Light the whole sheet evenly |
+| 👓 The grains look out of focus | Blurry photo: the phone focused elsewhere, or moved | Tap the screen on the grounds to focus and hold steady. Blurry shots read coarser and miss fines |
 | Could not detect a circular reference object | Coin hidden, cut off, glaring or buried in grounds | Coin fully in frame, clear paper around it |
 
 Photos sent through messaging apps usually lose their EXIF data, so the camera warning can't fire on them.
@@ -139,7 +145,7 @@ It also checks each photo's **distribution shape**:
 - **Within a setting:** a photo whose shape differs clearly from the other photos of its setting gets a warning. That usually means a spreading, lighting or camera problem.
 - **Against a calibration grind:** with `--reference SETTING`, every photo and setting is compared with that grind's shape, using the same/somewhat/clearly-different verdicts as the app. For example, `--reference 4.2` makes your known-good grind the yardstick when you add photos from another grinder. Each setting's D50 difference from the reference is listed too; a `*` marks settings more than 20% apart in D50, where part of the shape difference comes from the size gap.
 
-Output: `photos.csv` (one row per photo, including `clumped_pct`, `lighting_evenness_pct`, `span`, `gsd`, `skew`, the shape distances, `d50_vs_reference_pct` and `warnings`), per-grain CSVs, and `report.html`.
+Output: `photos.csv` (one row per photo, including `clumped_pct`, `lighting_evenness_pct`, `edge_width_mm`, `span`, `gsd`, `skew`, the shape distances, `d50_vs_reference_pct` and `warnings`), per-grain CSVs, and `report.html`.
 
 `gsd` (geometric SD) depends on how small a grain the camera can see, so compare it only between photos taken from the same distance. The shape distance hardly changes with distance (by 0.005 or less in testing).
 
@@ -179,7 +185,7 @@ Measured so far (one bean, one grinder, one phone: Motorola edge 2024, 2× main 
    - diameter of a circle with the same area;
    - volume as an ellipsoid whose hidden axis equals its short axis;
    - available mass, assuming water reaches 0.1 mm into each grain.
-8. **Checks**: camera from EXIF, clumping, and lighting evenness.
+8. **Checks**: camera from EXIF, clumping, lighting evenness, and focus (how far grain edges take to fade into the paper, in mm).
 
 Optional MobileSAM refinement of larger grains (`pip install -r requirements-sam.txt`, adds PyTorch) exists for comparison. It read grains too large in testing, so it's off by default.
 
