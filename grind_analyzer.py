@@ -14,7 +14,8 @@ Pipeline (every grain is measured the same way, whatever the spread density):
   7. Optional: MobileSAM refines larger grains (pip install -r requirements-sam.txt)
 
 Photo-quality checks, each with a *_warnings() helper: camera (flash or
-ultra-wide lens, from EXIF), spread (clumping) and lighting (shadows).
+ultra-wide lens, from EXIF), spread (clumping), lighting (shadows) and focus
+(blurred grain edges).
 """
 
 import cv2
@@ -127,6 +128,19 @@ SHAPE_SIZE_GAP = 0.2
 # than in direct light, and +11.5% where it was over 30% darker. Warn when part
 # of the paper (5th percentile) is darker than this fraction of the brightest.
 LIGHTING_WARN_RATIO = 0.7
+
+# Out-of-focus photos read coarser: blur joins neighbouring grains and loses faint
+# fines. Edge width (edge_width()) is how far a grain's edge takes to fade into the
+# paper, judged in mm so it doesn't depend on camera distance. In-focus lab photos
+# measured 0.12–0.33 mm (36 photos, 0.026–0.055 mm/px); 5 out-of-focus ones
+# 0.40–0.46 mm, with 25–56% fewer grains, fewer fines and D50 3–23% larger than
+# in-focus photos of the same grind. Even below the cut-off, D50 rose ~3.6% per
+# 0.1 mm of edge width across photos of one spread. Grains under FOCUS_MIN_AREA_PX
+# are too small to have a dark core; with fewer than FOCUS_MIN_GRAINS larger grains
+# the check is skipped.
+FOCUS_WARN_MM = 0.36
+FOCUS_MIN_AREA_PX = 50
+FOCUS_MIN_GRAINS = 20
 
 WEIGHTINGS = {
     "available mass": "Mass that water can reach (outer 0.1 mm of each grain), coffeegrindsize's default",
@@ -263,6 +277,46 @@ def lighting_warnings(evenness: float) -> list:
         return [f"Part of the paper is {100 * (1 - evenness):.0f}% darker than the rest (a shadow or uneven light). "
                 "In testing, the same grains read up to ~12% larger in shadow than in direct light. "
                 "Light the whole sheet evenly, with no hand or phone shadow on it."]
+    return []
+
+
+def edge_width(image_bgr: np.ndarray, particle_masks: list, coin_mask: np.ndarray = None) -> float:
+    """
+    Median width (px) over which grain edges fade into the paper: each grain's
+    contrast (paper minus its darkest tenth, paper-normalized) divided by the
+    brightness gradient along its outline (median). A step blurred over w px
+    gives w; in-focus photos read ~3–8 px. nan if fewer than FOCUS_MIN_GRAINS
+    grains of at least FOCUS_MIN_AREA_PX.
+    """
+    grains = [m for m in particle_masks if m["area"] >= FOCUS_MIN_AREA_PX]
+    if len(grains) < FOCUS_MIN_GRAINS:
+        return float("nan")
+    norm = _normalize_to_paper(image_bgr, coin_mask)
+    gradient = cv2.magnitude(cv2.Sobel(norm, cv2.CV_32F, 1, 0, ksize=3),
+                             cv2.Sobel(norm, cv2.CV_32F, 0, 1, ksize=3)) / 8  # 3×3 Sobel sums 8× the slope
+    kernel = np.ones((3, 3), np.uint8)
+    widths = []
+    for m in grains:
+        x0, y0, x1, y1 = m["bbox"]
+        seg = m["segmentation"]
+        # Outline: grain pixels with a non-grain neighbour (zero-padded so crop edges count)
+        outline = seg & (cv2.erode(np.pad(seg, 1).astype(np.uint8), kernel)[1:-1, 1:-1] == 0)
+        contrast = 1 - np.percentile(norm[y0:y1, x0:x1][seg], 10)
+        widths.append(contrast / max(float(np.median(gradient[y0:y1, x0:x1][outline])), 1e-3))
+    return float(np.median(widths))
+
+
+def focus_warnings(edge_width_px: float, pixel_scale: float) -> list:
+    """Warnings about an out-of-focus photo (needs the coin scale, since sharpness is judged per mm)."""
+    if pixel_scale <= 0 or not np.isfinite(edge_width_px):
+        return []
+    width_mm = edge_width_px * pixel_scale
+    if width_mm > FOCUS_WARN_MM:
+        return [f"The grains look out of focus: their edges fade over about {width_mm:.2f} mm "
+                f"(in focus: under {FOCUS_WARN_MM:.2f} mm). Blur makes a grind look coarser than it is. In testing, "
+                "blurry photos of the same grounds read up to ~20% coarser and missed many of the fines, so your "
+                "grind may be finer than these results say. Retake the photo: hold the phone steady, tap the "
+                "screen on the grounds to focus, and zoom in to check the grains have crisp edges."]
     return []
 
 

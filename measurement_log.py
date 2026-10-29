@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -24,7 +25,8 @@ from PIL import ExifTags, Image
 import grind_analyzer as ga
 
 # 1: first version. 2: adds "shape" (grind_analyzer.shape_signature) for shape comparisons.
-SCHEMA_VERSION = 2
+# 3: adds capture.edge_width_mm (grind_analyzer.edge_width, the focus check).
+SCHEMA_VERSION = 3
 
 BREW_METHODS = ["Drip machine", "Pour-over", "French press / immersion", "AeroPress", "Espresso",
                 "Cold brew", "Other"]
@@ -79,12 +81,16 @@ def _round(x, digits=4):
 
 
 def build_record(photo_bytes: bytes, result: "ga.AnalysisResult", *, coin_diameter_px: float,
-                 evenness: float, warnings: list, context: dict) -> dict:
+                 evenness: float, warnings: list, context: dict, edge_width_px: float = None) -> dict:
     """
     One measurement as a JSON-ready dict. `context` holds what the user entered
     (bean, grinder, setting, brew method, recipe, taste, TDS, notes).
     """
     calibrated = result.pixel_scale > 0
+    # Grain-edge width (focus check) in mm; None if uncalibrated or too few grains to measure it
+    edge_mm = None
+    if calibrated and edge_width_px is not None and math.isfinite(edge_width_px):
+        edge_mm = edge_width_px * result.pixel_scale
     d, w = result.diameters_mm, result.weights
     share_under_06 = (100 * w[d < 0.6].sum() / w.sum()) if calibrated and len(d) and w.sum() > 0 else None
     return {
@@ -97,6 +103,7 @@ def build_record(photo_bytes: bytes, result: "ga.AnalysisResult", *, coin_diamet
             "mm_per_px": _round(result.pixel_scale, 6),
             "coin_diameter_px": _round(coin_diameter_px, 1),
             "lighting_evenness_pct": _round(100 * evenness, 1),
+            "edge_width_mm": _round(edge_mm, 3),
             "clumped_pct": _round(result.clumped_pct, 1),
             "grains_measured": int(result.num_particles),
         },

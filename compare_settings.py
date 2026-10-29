@@ -25,15 +25,16 @@ block repeats the available-mass analysis with D50 adjusted to no clumping, usin
 how D50 moves with clumping within settings in this experiment (or the
 provisional default when clumping barely varies).
 
-Each photo is checked for flash / ultra-wide lens (EXIF), clumping and uneven
-light; warnings are printed and listed in the report. Each photo's distribution
-shape (span, geometric SD, skew; grind_analyzer.shape_signature) is also checked
-against the other photos of its setting, and with --reference SETTING against a
-calibration grind, so comparisons between unlike distributions are flagged.
+Each photo is checked for flash / ultra-wide lens (EXIF), clumping, uneven
+light and blur (grain-edge width); warnings are printed and listed in the
+report. Each photo's distribution shape (span, geometric SD, skew;
+grind_analyzer.shape_signature) is also checked against the other photos of its
+setting, and with --reference SETTING against a calibration grind, so
+comparisons between unlike distributions are flagged.
 
 Writes to --out: photos.csv (one row per photo, incl. clumped_pct,
-lighting_evenness_pct and warnings), particles/<setting>/... .csv (one row per
-single grain), and report.html (plots).
+lighting_evenness_pct, edge_width_mm and warnings), particles/<setting>/...
+.csv (one row per single grain), and report.html (plots).
 
 Note: repeat photos of one spread share the same grains, so they understate the
 spread-to-spread scatter; use separate spreads (and grinds) as replicates.
@@ -82,7 +83,7 @@ def find_photos(root: Path) -> list:
 
 
 def measure_photo(path: Path, args):
-    """Segment one photo. Returns (mm_per_px, clumped_pct, evenness, diameters, areas_px, volumes) or None."""
+    """Segment one photo. Returns (mm_per_px, clumped_pct, evenness, edge_width_px, diameters, areas_px, volumes) or None."""
     image = cv2.imread(str(path))
     if image is None:
         print(f"  ! could not read {path}")
@@ -103,7 +104,7 @@ def measure_photo(path: Path, args):
     clumps = ga.clump_flags(particles)
     singles = [p for p, c in zip(particles, clumps) if not c]
     return (scale, ga.clumped_percent(particles, clumps), ga.lighting_evenness(image, coin_mask),
-            *ga.particle_sizes(singles, scale))
+            ga.edge_width(image, particles, coin_mask), *ga.particle_sizes(singles, scale))
 
 
 def normal_cdf(x: float) -> float:
@@ -361,17 +362,18 @@ def main():
         measured = measure_photo(photo["path"], args)
         if measured is None:
             continue
-        scale, clumped, evenness, d, a, v = measured
+        scale, clumped, evenness, edge_px, d, a, v = measured
         if len(d) < MIN_PARTICLES:
             print(f"  ! only {len(d)} grains in {photo['path'].name}; skipped")
             continue
-        warnings = (ga.capture_warnings(photo["path"]) + ga.spread_warnings(clumped)
-                    + ga.lighting_warnings(evenness))
+        warnings = (ga.capture_warnings(photo["path"]) + ga.focus_warnings(edge_px, scale)
+                    + ga.spread_warnings(clumped) + ga.lighting_warnings(evenness))
         for warning in warnings:
             print(f"  ! {photo['path'].name}: {warning}")
         row = dict(setting=photo["setting"], sample=photo["sample"], photo=photo["path"].name,
                    n_particles=len(d), mm_per_px=round(scale, 6), clumped_pct=round(clumped, 1),
-                   lighting_evenness_pct=round(100 * evenness), warnings=" | ".join(warnings))
+                   lighting_evenness_pct=round(100 * evenness), edge_width_mm=round(edge_px * scale, 3),
+                   warnings=" | ".join(warnings))
         for weighting in ga.WEIGHTINGS:
             w, _ = ga.particle_weights(a, v, weighting, scale)
             stats = ga.size_stats(d, w)
@@ -422,7 +424,7 @@ def main():
     text += "\n\n" + verdict
     flagged = [r["photo"] for r in rows if r["warnings"]]
     if flagged:
-        text += (f"\n\n{len(flagged)} of {len(rows)} photos have warnings (flash, ultra-wide lens, clumped "
+        text += (f"\n\n{len(flagged)} of {len(rows)} photos have warnings (flash, ultra-wide lens, blur, clumped "
                  f"grains or uneven light) and are included above: {', '.join(flagged)}. Their sizes are "
                  "biased; consider reshooting them. See the warnings column in photos.csv.")
     print("\n" + text)
